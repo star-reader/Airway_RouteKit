@@ -1,5 +1,5 @@
 use crate::database::DatabasePool;
-use crate::error::{Result, RouteKitError};
+use crate::error::Result;
 use crate::models::*;
 use crate::utils::*;
 use lazy_static::lazy_static;

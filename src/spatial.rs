@@ -49,10 +49,28 @@ impl SpatialIndex {
 
     /// 查找最近的航点
     pub fn find_nearest(&self, coord: &Coordinate) -> Option<Waypoint> {
-        let point = [coord.longitude, coord.latitude];
-        self.rtree
-            .nearest_neighbor(&point)
-            .map(|sp| sp.waypoint.clone())
+        use crate::geo::haversine_distance_nm;
+
+        // 使用较小的半径先尝试查找
+        let mut radius = 50.0; // 从50海里开始
+        let max_radius = 1000.0; // 最大1000海里
+
+        while radius <= max_radius {
+            let nearby = self.find_within_radius(coord, radius);
+            if !nearby.is_empty() {
+                // 找到最近的一个
+                return nearby
+                    .into_iter()
+                    .min_by(|a, b| {
+                        let dist_a = haversine_distance_nm(coord, &a.coordinate);
+                        let dist_b = haversine_distance_nm(coord, &b.coordinate);
+                        dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+            }
+            radius *= 2.0; // 扩大搜索范围
+        }
+
+        None
     }
 
     /// 查找指定半径内的所有航点
@@ -93,12 +111,21 @@ impl SpatialIndex {
     pub fn find_k_nearest(&self, coord: &Coordinate, k: usize) -> Vec<Waypoint> {
         use crate::geo::haversine_distance_nm;
 
-        let point = [coord.longitude, coord.latitude];
+        let mut candidates: Vec<_> = self
+            .find_within_radius(coord, 500.0) // 500海里半径
+            .into_iter()
+            .map(|wp| {
+                let dist = haversine_distance_nm(coord, &wp.coordinate);
+                (wp, dist)
+            })
+            .collect();
 
-        self.rtree
-            .nearest_neighbor_iter(&point)
+        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        candidates
+            .into_iter()
             .take(k)
-            .map(|sp| sp.waypoint.clone())
+            .map(|(wp, _)| wp)
             .collect()
     }
 

@@ -139,6 +139,16 @@ impl RouteSearcher {
         goal: &Waypoint,
         request: &RouteRequest,
     ) -> Result<Vec<RouteSegment>> {
+        self.a_star_search_internal(start, goal, request)
+    }
+
+    /// A*搜索内部实现
+    fn a_star_search_internal(
+        &self,
+        start: &Waypoint,
+        goal: &Waypoint,
+        request: &RouteRequest,
+    ) -> Result<Vec<RouteSegment>> {
         #[derive(Clone)]
         struct Node {
             waypoint: Waypoint,
@@ -193,7 +203,39 @@ impl RouteSearcher {
 
             // 到达目标
             if current.waypoint.identifier == goal.identifier {
-                return Ok(self.reconstruct_path(&current));
+                // 重建路径
+                let mut segments = Vec::new();
+                let mut current_node = Some(&current);
+
+                while let Some(node) = current_node {
+                    if let Some(parent) = &node.parent {
+                        let distance = haversine_distance_nm(
+                            &parent.waypoint.coordinate,
+                            &node.waypoint.coordinate,
+                        );
+                        let bearing = crate::geo::calculate_bearing(
+                            &parent.waypoint.coordinate,
+                            &node.waypoint.coordinate,
+                        );
+
+                        segments.push(RouteSegment {
+                            from: parent.waypoint.clone(),
+                            to: node.waypoint.clone(),
+                            airway: node.airway.clone(),
+                            distance_nm: distance,
+                            magnetic_course: bearing,
+                            minimum_altitude: None,
+                            maximum_altitude: None,
+                        });
+
+                        current_node = Some(parent.as_ref());
+                    } else {
+                        break;
+                    }
+                }
+
+                segments.reverse();
+                return Ok(segments);
             }
 
             if closed_set.contains(&current.waypoint.identifier) {
@@ -287,7 +329,7 @@ impl RouteSearcher {
     }
 
     /// 查找航路连接
-    fn find_airway_connections(&self, waypoint: &Waypoint) -> Result<Vec<AirwaySegment>> {
+    fn find_airway_connections(&self, _waypoint: &Waypoint) -> Result<Vec<AirwaySegment>> {
         // 简化实现：在实际数据库中查找包含该航点的航路段
         // 这里需要一个更复杂的查询来找到相邻的航路段
         Ok(Vec::new())
@@ -318,41 +360,6 @@ impl RouteSearcher {
         cost
     }
 
-    /// 重建路径
-    fn reconstruct_path(&self, node: &Node) -> Vec<RouteSegment> {
-        let mut segments = Vec::new();
-        let mut current = Some(node);
-
-        while let Some(node) = current {
-            if let Some(parent) = &node.parent {
-                let distance = haversine_distance_nm(
-                    &parent.waypoint.coordinate,
-                    &node.waypoint.coordinate,
-                );
-                let bearing = crate::geo::calculate_bearing(
-                    &parent.waypoint.coordinate,
-                    &node.waypoint.coordinate,
-                );
-
-                segments.push(RouteSegment {
-                    from: parent.waypoint.clone(),
-                    to: node.waypoint.clone(),
-                    airway: node.airway.clone(),
-                    distance_nm: distance,
-                    magnetic_course: bearing,
-                    minimum_altitude: None,
-                    maximum_altitude: None,
-                });
-
-                current = Some(parent.as_ref());
-            } else {
-                break;
-            }
-        }
-
-        segments.reverse();
-        segments
-    }
 
     /// 查找最近的航点
     fn find_nearest_waypoint(&self, coord: &Coordinate) -> Result<Waypoint> {

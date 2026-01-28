@@ -1,11 +1,9 @@
 use crate::error::{Result, RouteKitError};
 use crate::models::*;
-use parking_lot::Mutex;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, OptionalExtension, Row};
 use std::path::Path;
-use std::sync::Arc;
 
 pub struct DatabasePool {
     pool: Pool<SqliteConnectionManager>,
@@ -243,7 +241,7 @@ impl DatabasePool {
         transition_id: Option<&str>,
     ) -> Result<Vec<SidStarWaypoint>> {
         let conn = self.get_connection()?;
-        let query = if let Some(trans) = transition_id {
+        let query = if transition_id.is_some() {
             "SELECT seqno, waypoint_identifier, waypoint_latitude, waypoint_longitude,
                     path_termination, magnetic_course, route_distance_holding_distance_time,
                     altitude_description, altitude1, altitude2, speed_limit
@@ -310,7 +308,7 @@ impl DatabasePool {
         transition_id: Option<&str>,
     ) -> Result<Vec<SidStarWaypoint>> {
         let conn = self.get_connection()?;
-        let query = if let Some(trans) = transition_id {
+        let query = if transition_id.is_some() {
             "SELECT seqno, waypoint_identifier, waypoint_latitude, waypoint_longitude,
                     path_termination, magnetic_course, route_distance_holding_distance_time,
                     altitude_description, altitude1, altitude2, speed_limit

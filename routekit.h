@@ -1,9 +1,3 @@
-/**
- * RouteKit FFI 头文件
- * 
- * 供C/Go等语言调用的FFI接口定义
- */
-
 #ifndef ROUTEKIT_H
 #define ROUTEKIT_H
 

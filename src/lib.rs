@@ -40,7 +40,7 @@ pub mod utils;
 pub use config::Config;
 pub use error::{Result, RouteKitError};
 pub use models::*;
-pub use route::{RouteRequest, RouteSearcher};
+pub use route::RouteSearcher;
 
 use database::DatabasePool;
 use parser::RouteParser;
