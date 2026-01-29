@@ -51,11 +51,25 @@ impl Ord for SearchNode {
     }
 }
 
+/// 计算坐标哈希值（用于区分同名但不同位置的航点）
+fn calc_coord_hash(coord: &Coordinate) -> i64 {
+    // 将坐标转换为整数（保留4位小数精度）
+    let lat_int = (coord.latitude * 10000.0).round() as i64;
+    let lon_int = (coord.longitude * 10000.0).round() as i64;
+    // 组合成唯一哈希值
+    lat_int * 10000000 + lon_int
+}
+
+/// 生成唯一节点key（名称+坐标哈希）
+fn make_node_key(identifier: &str, coord: &Coordinate) -> String {
+    format!("{}_{}", identifier, calc_coord_hash(coord))
+}
+
 /// 航路图
 struct AirwayGraph {
     /// 节点列表：(航点标识符, 坐标)
     nodes: Vec<(String, Coordinate)>,
-    /// 航点标识符 -> 节点索引
+    /// 节点唯一key -> 节点索引
     node_index: HashMap<String, usize>,
     /// 邻接表：每个节点的出边列表
     adjacency: Vec<Vec<Edge>>,
@@ -70,14 +84,15 @@ impl AirwayGraph {
         }
     }
 
-    /// 获取或创建节点索引
+    /// 获取或创建节点索引（使用名称+坐标哈希作为唯一标识）
     fn get_or_create_node(&mut self, identifier: &str, coord: Coordinate) -> usize {
-        if let Some(&idx) = self.node_index.get(identifier) {
+        let key = make_node_key(identifier, &coord);
+        if let Some(&idx) = self.node_index.get(&key) {
             return idx;
         }
         let idx = self.nodes.len();
         self.nodes.push((identifier.to_string(), coord));
-        self.node_index.insert(identifier.to_string(), idx);
+        self.node_index.insert(key, idx);
         self.adjacency.push(Vec::new());
         idx
     }
@@ -101,9 +116,27 @@ impl AirwayGraph {
         &self.nodes[idx].0
     }
 
-    /// 获取节点索引
-    fn get_index(&self, identifier: &str) -> Option<usize> {
-        self.node_index.get(identifier).copied()
+    /// 通过名称和坐标获取节点索引
+    fn get_index_by_coord(&self, identifier: &str, coord: &Coordinate) -> Option<usize> {
+        let key = make_node_key(identifier, coord);
+        self.node_index.get(&key).copied()
+    }
+    
+    /// 通过名称查找最近的节点（用于SID/STAR入口点匹配）
+    fn find_nearest_node(&self, identifier: &str, near_coord: &Coordinate) -> Option<usize> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_dist = f64::INFINITY;
+        
+        for (idx, (name, coord)) in self.nodes.iter().enumerate() {
+            if name == identifier {
+                let dist = haversine_distance_nm(near_coord, coord);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_idx = Some(idx);
+                }
+            }
+        }
+        best_idx
     }
 }
 
@@ -238,13 +271,13 @@ impl RouteSearcher {
         
         // 尝试不同的起点/终点组合
         for start_wp in start_waypoints.iter().take(3) {
-            let start_idx = match graph.get_index(&start_wp.identifier) {
+            let start_idx = match graph.get_index_by_coord(&start_wp.identifier, &start_wp.coordinate) {
                 Some(idx) => idx,
                 None => continue,
             };
             
             for end_wp in end_waypoints.iter().take(3) {
-                let end_idx = match graph.get_index(&end_wp.identifier) {
+                let end_idx = match graph.get_index_by_coord(&end_wp.identifier, &end_wp.coordinate) {
                     Some(idx) => idx,
                     None => continue,
                 };
@@ -348,16 +381,16 @@ impl RouteSearcher {
         let graph = self.graph.read();
         let graph = graph.as_ref().unwrap();
         
-        let mut best_route: Option<(Vec<(String, String, usize)>, f64, String)> = None;
+        let mut best_route: Option<(Vec<(String, String, usize)>, f64, String, usize)> = None;
         
         for start_wp in start_waypoints.iter().take(3) {
-            let start_idx = match graph.get_index(&start_wp.identifier) {
+            let start_idx = match graph.get_index_by_coord(&start_wp.identifier, &start_wp.coordinate) {
                 Some(idx) => idx,
                 None => continue,
             };
             
             for end_wp in end_waypoints.iter().take(3) {
-                let end_idx = match graph.get_index(&end_wp.identifier) {
+                let end_idx = match graph.get_index_by_coord(&end_wp.identifier, &end_wp.coordinate) {
                     Some(idx) => idx,
                     None => continue,
                 };
@@ -365,7 +398,7 @@ impl RouteSearcher {
                 if let Some((route_list, total_dist)) = self.dijkstra(graph, start_idx, end_idx) {
                     // 保留最短的
                     if best_route.is_none() || total_dist < best_route.as_ref().unwrap().1 {
-                        best_route = Some((route_list, total_dist, start_wp.identifier.clone()));
+                        best_route = Some((route_list, total_dist, start_wp.identifier.clone(), start_idx));
                     }
                 }
             }
@@ -375,8 +408,8 @@ impl RouteSearcher {
         log::info!("航路搜索完成，耗时 {:.2}s", elapsed.as_secs_f64());
         
         match best_route {
-            Some((route_list, total_dist, start_wp_id)) => {
-                let route = self.build_route(&departure, &destination, graph, &route_list, total_dist, &start_wp_id)?;
+            Some((route_list, total_dist, start_wp_id, start_idx)) => {
+                let route = self.build_route(&departure, &destination, graph, &route_list, total_dist, &start_wp_id, start_idx)?;
                 Ok(vec![route])
             }
             None => Err(RouteKitError::RouteNotFound {
@@ -453,7 +486,7 @@ impl RouteSearcher {
         None
     }
 
-    /// 构建航路字符串（合并连续相同的航路）
+    /// 构建航路字符串（合并连续相同的航路，格式：机场 航点 航路 航点 航路 航点 机场）
     fn build_route_string(
         &self,
         departure_icao: &str,
@@ -469,22 +502,33 @@ impl RouteSearcher {
         // 第一个航点
         parts.push(first_waypoint.to_string());
         
-        // 合并连续相同的航路
-        let mut last_airway: Option<&str> = None;
+        if route_list.is_empty() {
+            parts.push(destination_icao.to_string());
+            return parts.join(" ");
+        }
         
-        for (airway, _waypoint, _) in route_list {
-            // 如果航路改变，添加新航路和航点
-            if last_airway.map(|a| a != airway).unwrap_or(true) {
+        // 合并连续相同的航路，在航路切换时输出航点
+        // 格式: DEP WP1 AWY1 WP2 AWY2 WP3 ARR
+        let mut last_airway: Option<&str> = None;
+        let mut last_waypoint: Option<&str> = None;
+        
+        for (airway, waypoint, _) in route_list {
+            if last_airway.map(|a| a != airway.as_str()).unwrap_or(true) {
+                // 航路改变了
+                // 如果有上一个航路的最后航点，先输出它
+                if let Some(wp) = last_waypoint {
+                    parts.push(wp.to_string());
+                }
+                // 输出新航路
                 parts.push(airway.clone());
-                last_airway = Some(airway);
             }
-            // 最后一个航点总是添加
-            // 但我们需要在航路切换时添加航点
+            last_airway = Some(airway.as_str());
+            last_waypoint = Some(waypoint.as_str());
         }
         
         // 添加最后一个航点
-        if let Some((_, last_waypoint, _)) = route_list.last() {
-            parts.push(last_waypoint.clone());
+        if let Some(wp) = last_waypoint {
+            parts.push(wp.to_string());
         }
         
         // 目的机场
@@ -502,6 +546,7 @@ impl RouteSearcher {
         route_list: &[(String, String, usize)],
         total_dist: f64,
         first_waypoint_id: &str,
+        first_waypoint_idx: usize,
     ) -> Result<Route> {
         let mut segments = Vec::new();
         
@@ -518,34 +563,27 @@ impl RouteSearcher {
         }
         
         // 构建航段
-        let mut prev_idx: Option<usize> = None;
+        let mut prev_idx = first_waypoint_idx;
         let mut prev_id = first_waypoint_id.to_string();
         
-        // 找到第一个航点的索引
-        if let Some(first_idx) = graph.get_index(first_waypoint_id) {
-            prev_idx = Some(first_idx);
-        }
-        
         for (airway, waypoint_id, idx) in route_list {
-            if let Some(from_idx) = prev_idx {
-                let from_coord = graph.get_coord(from_idx);
-                let to_coord = graph.get_coord(*idx);
-                
-                let distance = haversine_distance_nm(from_coord, to_coord);
-                let bearing = crate::geo::calculate_bearing(from_coord, to_coord);
-                
-                segments.push(RouteSegment {
-                    from: Waypoint::simple(&prev_id, from_coord.latitude, from_coord.longitude)?,
-                    to: Waypoint::simple(waypoint_id, to_coord.latitude, to_coord.longitude)?,
-                    airway: Some(airway.clone()),
-                    distance_nm: distance,
-                    magnetic_course: bearing,
-                    minimum_altitude: None,
-                    maximum_altitude: None,
-                });
-            }
+            let from_coord = graph.get_coord(prev_idx);
+            let to_coord = graph.get_coord(*idx);
             
-            prev_idx = Some(*idx);
+            let distance = haversine_distance_nm(from_coord, to_coord);
+            let bearing = crate::geo::calculate_bearing(from_coord, to_coord);
+            
+            segments.push(RouteSegment {
+                from: Waypoint::simple(&prev_id, from_coord.latitude, from_coord.longitude)?,
+                to: Waypoint::simple(waypoint_id, to_coord.latitude, to_coord.longitude)?,
+                airway: Some(airway.clone()),
+                distance_nm: distance,
+                magnetic_course: bearing,
+                minimum_altitude: None,
+                maximum_altitude: None,
+            });
+            
+            prev_idx = *idx;
             prev_id = waypoint_id.clone();
         }
         

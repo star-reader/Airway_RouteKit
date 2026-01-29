@@ -114,6 +114,7 @@ fn main() -> Result<()> {
             println!("   找到 {} 条航路:", routes.len());
             for (i, route) in routes.iter().enumerate() {
                 println!("\n   航路 {}:", i + 1);
+                println!("     航路字符串: {}", route.to_route_string());
                 println!("     总距离: {:.2} 海里", route.total_distance_nm);
                 println!("     航段数: {}", route.segments.len());
                 if let Some(time) = route.estimated_time_minutes {
