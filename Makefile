@@ -4,11 +4,17 @@ all: build
 
 build:
 	@echo "building RouteKit..."
-	cargo build
+	cargo build --release
 
 release:
 	@echo "building RouteKit release..."
 	cargo build --release
+
+build-linux:
+	@echo "building RouteKit release for linux"
+	export LIBSQLITE3_SYS_USE_BUNDLED=1 && \
+	export LIBSQLITE3_SYS_USE_PKG_CONFIG=0 && \
+	cargo zigbuild --release --target x86_64-unknown-linux-gnu
 
 test:
 	@echo "running tests..."

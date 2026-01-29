@@ -1,0 +1,8 @@
+[target.x86_64-unknown-linux-gnu]
+linker = "zig"
+rustflags = ["-C", "link-arg=-static"]
+
+[target.x86_64-unknown-linux-gnu.env]
+CC = "zig cc -target x86_64-linux-gnu.2.28"
+CXX = "zig c++ -target x86_64-linux-gnu.2.28"
+AR = "zig ar"
