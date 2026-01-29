@@ -1,37 +1,64 @@
-# RouteKit - 航空航路计算与解析库
+# Airway RouteKit - Aviation Route Calculation and Parsing Library
 
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-一个用Rust开发的高性能航空航路计算和解析库，为飞行计划系统、模拟飞行软件和其他航空应用提供核心路由功能。
+A high-performance aviation route calculation and parsing library developed in Rust, providing core routing functionality for flight planning systems, flight simulation software, and other aviation applications.
 
-## 安装
+## Features
 
-添加到 `Cargo.toml`:
+- **Route Calculation**: Find optimal routes between airports with various preferences
+- **Route Parsing**: Parse and validate aviation route strings in multiple formats
+- **Geographic Calculations**: Accurate great circle distance and bearing calculations
+- **Spatial Search**: Find waypoints and navigation aids within specified areas
+- **High Performance**: Optimized for real-time aviation applications
+- **Comprehensive Database Support**: Works with aviation navigation databases
+
+## Installation
+
+### Prerequisites
+
+- Rust 1.70 or higher
+- Aviation navigation database (compatible SQLite format)
+
+### Build from Source
+
+1. Clone the repository:
+
+```bash
+git clone https://github.com/star-reader/Airway_RouteKit.git
+cd Airway_RouteKit
+```
+
+2. Build the library:
+
+```bash
+cargo build --release
+```
+
+3. The static and dynamic libraries will be available in the `target/release/` directory.
+
+### Using as a Rust Dependency
+
+Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-airway_routekit = "0.1"
+airway_routekit = { path = "/path/to/Airway_RouteKit" }
 ```
 
-或使用cargo命令：
+## Quick Start
 
-```bash
-cargo add airway_routekit
-```
-
-## 快速开始
-
-### 基本使用
+### Basic Usage
 
 ```rust
 use routekit::*;
 
 fn main() -> Result<()> {
-    // 创建RouteKit实例
+    // Create RouteKit instance
     let kit = RouteKit::new("path/to/database.s3db")?;
 
-    // 查询航路
+    // Query routes
     let request = RouteRequest {
         departure_icao: "ZBAA".to_string(),
         destination_icao: "ZSPD".to_string(),
@@ -42,31 +69,31 @@ fn main() -> Result<()> {
 
     let routes = kit.find_routes(&request)?;
     for route in routes {
-        println!("航路总距离: {} 海里", route.total_distance_nm);
+        println!("Total route distance: {} nautical miles", route.total_distance_nm);
     }
 
     Ok(())
 }
 ```
 
-### 航路解析
+### Route Parsing
 
 ```rust
 use routekit::RouteKit;
 
 let kit = RouteKit::new("database.s3db")?;
 
-// 支持多种格式
+// Support multiple formats
 let parsed = kit.parse_route("ZBAA SID TEPID G212 VYK STAR ZSPD")?;
 
 if parsed.is_valid {
-    println!("起飞: {:?}", parsed.departure);
-    println!("目的: {:?}", parsed.destination);
-    println!("航路元素: {}", parsed.elements.len());
+    println!("Departure: {:?}", parsed.departure);
+    println!("Destination: {:?}", parsed.destination);
+    println!("Route elements: {}", parsed.elements.len());
 }
 ```
 
-### 地理计算
+### Geographic Calculations
 
 ```rust
 use routekit::{Coordinate, geo};
@@ -74,30 +101,189 @@ use routekit::{Coordinate, geo};
 let beijing = Coordinate::new(39.9042, 116.4074)?;
 let shanghai = Coordinate::new(31.2304, 121.4737)?;
 
-// 计算大圆距离
+// Calculate great circle distance
 let distance = geo::haversine_distance_nm(&beijing, &shanghai);
-println!("距离: {:.2} 海里", distance);
+println!("Distance: {:.2} nautical miles", distance);
 
-// 计算航向
+// Calculate bearing
 let bearing = geo::calculate_bearing(&beijing, &shanghai);
-println!("航向: {:.2}°", bearing);
+println!("Bearing: {:.2}°", bearing);
 ```
 
-### 空间搜索
+### Spatial Search
 
 ```rust
 let coord = Coordinate::new(40.0, 116.0)?;
 
-// 查找最近的航点
+// Find nearest waypoint
 if let Some(waypoint) = kit.find_nearest_waypoint(&coord) {
-    println!("最近航点: {}", waypoint.identifier);
+    println!("Nearest waypoint: {}", waypoint.identifier);
 }
 
-// 查找半径内的所有航点
+// Find all waypoints within radius
 let nearby = kit.find_waypoints_within_radius(&coord, 50.0);
-println!("找到 {} 个航点", nearby.len());
+println!("Found {} waypoints", nearby.len());
 ```
 
----
+## Usage from Other Languages
 
-**注意**: 本库需要配合航空导航数据库使用，请确保你有合法的数据库访问权限。
+### C++ Integration
+
+The library provides C-compatible bindings for C++ integration:
+
+```cpp
+#include <iostream>
+#include "routekit_c.h"
+
+int main() {
+    // Initialize RouteKit
+    RouteKit* kit = routekit_new("database.s3db");
+    if (!kit) {
+        std::cerr << "Failed to initialize RouteKit" << std::endl;
+        return 1;
+    }
+
+    // Create route request
+    RouteRequest request = {};
+    request.departure_icao = "ZBAA";
+    request.destination_icao = "ZSPD";
+    request.flight_level = FL_HIGH;
+    request.route_preference = ROUTE_BALANCED;
+    request.max_routes = 3;
+
+    // Find routes
+    RouteResponse* response = routekit_find_routes(kit, &request);
+    if (response) {
+        for (int i = 0; i < response->route_count; i++) {
+            std::cout << "Route " << i << ": " 
+                      << response->routes[i].total_distance_nm 
+                      << " NM" << std::endl;
+        }
+        routekit_free_response(response);
+    }
+
+    // Cleanup
+    routekit_destroy(kit);
+    return 0;
+}
+```
+
+Compile with:
+
+```bash
+g++ -o example example.cpp -L./target/release -lroutekit -I./include
+```
+
+### Go Integration
+
+Use cgo to integrate with the Rust library:
+
+```go
+package main
+
+/*
+#cgo LDFLAGS: -L./target/release -lroutekit
+#cgo CFLAGS: -I./include
+#include "routekit_c.h"
+*/
+import "C"
+import (
+    "fmt"
+    "unsafe"
+)
+
+func main() {
+    // Initialize RouteKit
+    dbPath := C.CString("database.s3db")
+    defer C.free(unsafe.Pointer(dbPath))
+  
+    kit := C.routekit_new(dbPath)
+    if kit == nil {
+        fmt.Println("Failed to initialize RouteKit")
+        return
+    }
+    defer C.routekit_destroy(kit)
+
+    // Create route request
+    request := C.RouteRequest{
+        departure_icao:   C.CString("ZBAA"),
+        destination_icao: C.CString("ZSPD"),
+        flight_level:     C.FL_HIGH,
+        route_preference: C.ROUTE_BALANCED,
+        max_routes:       3,
+    }
+    defer C.free(unsafe.Pointer(request.departure_icao))
+    defer C.free(unsafe.Pointer(request.destination_icao))
+
+    // Find routes
+    response := C.routekit_find_routes(kit, &request)
+    if response != nil {
+        defer C.routekit_free_response(response)
+      
+        routes := (*[1 << 28]C.Route)(unsafe.Pointer(response.routes))[:response.route_count:response.route_count]
+        for i, route := range routes {
+            fmt.Printf("Route %d: %.2f NM\n", i, route.total_distance_nm)
+        }
+    }
+}
+```
+
+Build with:
+
+```bash
+go build -o example example.go
+```
+
+## API Documentation
+
+### Core Components
+
+- **RouteKit**: Main library interface for route operations
+- **RouteRequest**: Configuration for route queries
+- **RouteResponse**: Contains calculated route information
+- **Coordinate**: Geographic coordinate representation
+- **Waypoint**: Navigation waypoint data structure
+
+### Route Preferences
+
+- **Direct**: Shortest distance route
+- **Balanced**: Balance between distance and efficiency
+- **Economic**: Fuel-efficient routing
+- **Time**: Time-optimized routing
+
+### Flight Levels
+
+- **Low**: Below FL245
+- **High**: FL245 and above
+- **Custom**: Specific flight level
+
+## Database Requirements
+
+This library requires an aviation navigation database to function properly. The database should include:
+
+- Airport information (ICAO/IATA codes, coordinates, runways)
+- Waypoints and navigation aids
+- Airway structures and connections
+- Standard Instrument Departures (SIDs)
+- Standard Terminal Arrival Routes (STARs)
+
+**Note**: Ensure you have proper licensing and legal access to aviation navigation databases.
+
+## Performance
+
+- Optimized for real-time route calculations
+- Efficient spatial indexing for waypoint searches
+- Minimal memory footprint
+- Thread-safe operations
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Disclaimer
+
+This library is intended for educational and simulation purposes. **It can't use in real flight!**  For aviation applications, ensure compliance with relevant aviation authorities and regulations.
