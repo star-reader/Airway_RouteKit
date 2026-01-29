@@ -169,14 +169,47 @@ impl RouteParser {
 
             // 处理航路
             if AIRWAY_PATTERN.is_match(&token_upper) {
-                if let Ok(segments) = self.db_pool.find_airway_segments(&token_upper) {
-                    if !segments.is_empty() {
-                        parsed.elements.push(RouteElement::Airway {
-                            identifier: token_upper.clone(),
-                            segments: segments.clone(),
-                        });
-                        if let Some(last_seg) = segments.last() {
-                            last_waypoint = Some(last_seg.waypoint.clone());
+                // 获取前一个航点名称
+                let from_waypoint_id = last_waypoint.as_ref().map(|wp| wp.identifier.clone());
+                
+                // 获取下一个航点名称（如果有的话）
+                let to_waypoint_id = if i + 1 < tokens.len() {
+                    let next_token = &tokens[i + 1].to_uppercase();
+                    // 下一个token可能是航点或机场
+                    if !AIRWAY_PATTERN.is_match(next_token) 
+                        && !matches!(next_token.as_str(), "VIA" | "TO" | "FROM" | "AT" | "FL" | "THE" | "DCT" | "SID" | "STAR") 
+                    {
+                        Some(next_token.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                
+                // 获取航路的所有航段
+                if let Ok(all_segments) = self.db_pool.find_airway_segments(&token_upper) {
+                    if !all_segments.is_empty() {
+                        // 截取从 from_waypoint 到 to_waypoint 之间的航段
+                        let filtered_segments = self.extract_airway_segment(
+                            &all_segments, 
+                            from_waypoint_id.as_deref(), 
+                            to_waypoint_id.as_deref()
+                        );
+                        
+                        if !filtered_segments.is_empty() {
+                            parsed.elements.push(RouteElement::Airway {
+                                identifier: token_upper.clone(),
+                                segments: filtered_segments.clone(),
+                            });
+                            if let Some(last_seg) = filtered_segments.last() {
+                                last_waypoint = Some(last_seg.waypoint.clone());
+                            }
+                        } else {
+                            parsed.warnings.push(format!(
+                                "航路 {} 中未找到从 {:?} 到 {:?} 的航段", 
+                                token_upper, from_waypoint_id, to_waypoint_id
+                            ));
                         }
                     } else {
                         parsed.warnings.push(format!("航路 {} 未找到航段", token_upper));
@@ -247,6 +280,56 @@ impl RouteParser {
             Some(name)
         } else {
             Some(token.to_string())
+        }
+    }
+
+    /// 从完整航路中提取指定起止航点之间的航段
+    /// 
+    /// segments 已经按照 seqno 排序（可能正向或反向飞行）
+    /// from_waypoint: 起始航点名称（可选）
+    /// to_waypoint: 结束航点名称（可选）
+    fn extract_airway_segment(
+        &self,
+        segments: &[AirwaySegment],
+        from_waypoint: Option<&str>,
+        to_waypoint: Option<&str>,
+    ) -> Vec<AirwaySegment> {
+        if segments.is_empty() {
+            return vec![];
+        }
+
+        // 找出 from_waypoint 和 to_waypoint 在航路中的位置（索引）
+        let from_idx = from_waypoint.and_then(|from| {
+            segments.iter().position(|seg| seg.waypoint.identifier.eq_ignore_ascii_case(from))
+        });
+        
+        let to_idx = to_waypoint.and_then(|to| {
+            segments.iter().position(|seg| seg.waypoint.identifier.eq_ignore_ascii_case(to))
+        });
+
+        match (from_idx, to_idx) {
+            // 两个航点都找到了
+            (Some(from), Some(to)) => {
+                if from <= to {
+                    // 正向飞行
+                    segments[from..=to].to_vec()
+                } else {
+                    // 反向飞行
+                    segments[to..=from].iter().rev().cloned().collect()
+                }
+            }
+            // 只找到起始航点
+            (Some(from), None) => {
+                segments[from..].to_vec()
+            }
+            // 只找到结束航点
+            (None, Some(to)) => {
+                segments[..=to].to_vec()
+            }
+            // 都没找到，返回全部
+            (None, None) => {
+                segments.to_vec()
+            }
         }
     }
 

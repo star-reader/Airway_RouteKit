@@ -19,16 +19,16 @@ import (
 // Route 航路结构
 type Route struct {
 	Departure struct {
-		IcaoCode   string  `json:"icao_code"`
-		Identifier string  `json:"identifier"`
+		IcaoCode   string `json:"icao_code"`
+		Identifier string `json:"identifier"`
 		Coordinate struct {
 			Latitude  float64 `json:"latitude"`
 			Longitude float64 `json:"longitude"`
 		} `json:"coordinate"`
 	} `json:"departure"`
 	Destination struct {
-		IcaoCode   string  `json:"icao_code"`
-		Identifier string  `json:"identifier"`
+		IcaoCode   string `json:"icao_code"`
+		Identifier string `json:"identifier"`
 		Coordinate struct {
 			Latitude  float64 `json:"latitude"`
 			Longitude float64 `json:"longitude"`

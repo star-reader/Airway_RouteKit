@@ -168,6 +168,44 @@ impl Route {
     pub fn calculate_total_distance(&self) -> f64 {
         self.segments.iter().map(|s| s.distance_nm).sum()
     }
+    
+    /// 生成航路字符串
+    pub fn to_route_string(&self) -> String {
+        let mut parts = Vec::new();
+        
+        // 起飞机场
+        parts.push(self.departure.identifier.clone());
+        
+        // SID
+        if let Some(sid) = &self.sid {
+            parts.push(sid.procedure_identifier.clone());
+        }
+        
+        // 航路段
+        for segment in &self.segments {
+            if let Some(airway) = &segment.airway {
+                parts.push(airway.clone());
+            }
+            parts.push(segment.to.identifier.clone());
+        }
+        
+        // STAR
+        if let Some(star) = &self.star {
+            parts.push(star.procedure_identifier.clone());
+        }
+        
+        // 目的机场
+        parts.push(self.destination.identifier.clone());
+        
+        parts.join(" ")
+    }
+}
+
+/// 简化的航路结果（只包含字符串和距离）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteResult {
+    pub route_string: String,
+    pub total_distance_nm: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
