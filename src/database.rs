@@ -148,6 +148,99 @@ impl DatabasePool {
             })
             .optional()?;
 
+        if waypoint.is_some() {
+            return Ok(waypoint);
+        }
+
+        // 在 VHF 导航台（VOR/DME/VORTAC）中查找
+        let mut stmt = conn.prepare(
+            "SELECT vor_identifier, icao_code, vor_name, 
+                    vor_latitude, vor_longitude
+             FROM tbl_vhfnavaids 
+             WHERE vor_identifier = ?1 
+             LIMIT 1"
+        )?;
+
+        let waypoint = stmt
+            .query_row(params![identifier], |row| {
+                let lat: f64 = row.get(3)?;
+                let lon: f64 = row.get(4)?;
+                
+                Ok(Waypoint {
+                    identifier: row.get::<_, String>(0)?,
+                    icao_code: row.get::<_, String>(1).unwrap_or_default(),
+                    name: row.get::<_, Option<String>>(2)?,
+                    coordinate: Coordinate::new(lat, lon)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    waypoint_type: WaypointType::VOR,
+                    usage: None,
+                    id: None,
+                })
+            })
+            .optional()?;
+
+        if waypoint.is_some() {
+            return Ok(waypoint);
+        }
+
+        // 在航路 NDB 导航台中查找
+        let mut stmt = conn.prepare(
+            "SELECT ndb_identifier, icao_code, ndb_name, 
+                    ndb_latitude, ndb_longitude
+             FROM tbl_enroute_ndbnavaids 
+             WHERE ndb_identifier = ?1 
+             LIMIT 1"
+        )?;
+
+        let waypoint = stmt
+            .query_row(params![identifier], |row| {
+                let lat: f64 = row.get(3)?;
+                let lon: f64 = row.get(4)?;
+                
+                Ok(Waypoint {
+                    identifier: row.get::<_, String>(0)?,
+                    icao_code: row.get::<_, String>(1).unwrap_or_default(),
+                    name: row.get::<_, Option<String>>(2)?,
+                    coordinate: Coordinate::new(lat, lon)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    waypoint_type: WaypointType::NDB,
+                    usage: None,
+                    id: None,
+                })
+            })
+            .optional()?;
+
+        if waypoint.is_some() {
+            return Ok(waypoint);
+        }
+
+        // 在终端区 NDB 导航台中查找
+        let mut stmt = conn.prepare(
+            "SELECT ndb_identifier, icao_code, ndb_name, 
+                    ndb_latitude, ndb_longitude
+             FROM tbl_terminal_ndbnavaids 
+             WHERE ndb_identifier = ?1 
+             LIMIT 1"
+        )?;
+
+        let waypoint = stmt
+            .query_row(params![identifier], |row| {
+                let lat: f64 = row.get(3)?;
+                let lon: f64 = row.get(4)?;
+                
+                Ok(Waypoint {
+                    identifier: row.get::<_, String>(0)?,
+                    icao_code: row.get::<_, String>(1).unwrap_or_default(),
+                    name: row.get::<_, Option<String>>(2)?,
+                    coordinate: Coordinate::new(lat, lon)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    waypoint_type: WaypointType::NDB,
+                    usage: None,
+                    id: None,
+                })
+            })
+            .optional()?;
+
         Ok(waypoint)
     }
 
