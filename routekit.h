@@ -9,28 +9,28 @@ extern "C" {
 #endif
 
 /**
- * 创建RouteKit实例
+ * Create RouteKit instance
  * 
- * @param db_path 数据库文件路径（UTF-8编码的C字符串）
- * @return RouteKit实例句柄，失败返回NULL
+ * @param db_path Database file path (UTF-8 encoded C string)
+ * @return RouteKit instance handle, returns NULL on failure
  */
 void* routekit_new(const char* db_path);
 
 /**
- * 销毁RouteKit实例
+ * Destroy RouteKit instance
  * 
- * @param handle RouteKit实例句柄
+ * @param handle RouteKit instance handle
  */
 void routekit_free(void* handle);
 
 /**
- * 查找航路
+ * Find routes
  * 
- * @param handle RouteKit实例句柄
- * @param departure_icao 起飞机场ICAO代码
- * @param destination_icao 目的机场ICAO代码
- * @param max_routes 最大返回航路数
- * @return JSON格式的航路信息，需要调用routekit_free_string释放
+ * @param handle RouteKit instance handle
+ * @param departure_icao Departure airport ICAO code
+ * @param destination_icao Destination airport ICAO code
+ * @param max_routes Maximum number of routes to return
+ * @return JSON string of route information, needs to be freed with routekit_free_string
  */
 char* routekit_find_routes(
     void* handle,
@@ -40,33 +40,33 @@ char* routekit_find_routes(
 );
 
 /**
- * 解析航路字符串
+ * Parse route string
  * 
- * @param handle RouteKit实例句柄
- * @param route_string 航路字符串
- * @return JSON格式的解析结果，需要调用routekit_free_string释放
+ * @param handle RouteKit instance handle
+ * @param route_string Route string
+ * @return JSON string of parsing result, needs to be freed with routekit_free_string
  */
 char* routekit_parse_route(void* handle, const char* route_string);
 
 /**
- * 释放FFI返回的字符串
+ * Free FFI returned string
  * 
- * @param s 需要释放的字符串指针
+ * @param s String pointer to free
  */
 void routekit_free_string(char* s);
 
 /**
- * 获取最后一次错误信息
+ * Get last error message
  * 
- * @return 错误信息字符串（静态字符串，不需要释放）
+ * @return Error message string (static string, does not need to be freed)
  */
 const char* routekit_last_error(void);
 
 /**
- * 检查RouteKit实例是否有效
+ * Check if RouteKit instance is valid
  * 
- * @param handle RouteKit实例句柄
- * @return true表示有效，false表示无效
+ * @param handle RouteKit instance handle
+ * @return true if valid, false if invalid
  */
 bool routekit_is_valid(void* handle);
 
