@@ -184,6 +184,40 @@ impl RouteKit {
         Ok(routes)
     }
 
+    /// 查询航路（简化版本，仅返回route_string和total_distance_nm）
+    /// 
+    /// # 示例
+    /// 
+    /// ```no_run
+    /// use routekit::{RouteKit, RouteRequest};
+    /// 
+    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let request = RouteRequest {
+    ///     departure_icao: "ZBAA".to_string(),
+    ///     destination_icao: "ZSPD".to_string(),
+    ///     ..Default::default()
+    /// };
+    /// 
+    /// let results = kit.find_routes_simple(&request).unwrap();
+    /// for result in results {
+    ///     println!("{} ({:.1}nm)", result.route_string, result.total_distance_nm);
+    /// }
+    /// ```
+    pub fn find_routes_simple(&self, request: &RouteRequest) -> Result<Vec<crate::models::RouteResult>> {
+        log::debug!(
+            "开始查询航路(简化): {} -> {}",
+            request.departure_icao,
+            request.destination_icao
+        );
+
+        // 直接调用简化版搜索
+        let results = self.route_searcher.search_routes_simple(request)?;
+
+        log::debug!("找到 {} 条航路", results.len());
+
+        Ok(results)
+    }
+
     /// 解析航路字符串
     ///
     /// # 参数

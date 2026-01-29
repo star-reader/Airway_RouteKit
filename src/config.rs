@@ -30,9 +30,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             db_pool_size: 10,
-            max_search_depth: 1000,
+            max_search_depth: 2000,
             search_timeout_ms: 5000,
-            spatial_search_radius_nm: 50.0,
+            spatial_search_radius_nm: 20.0,
             enable_cache: true,
             cache_size: 1000,
             verbose_logging: false,
