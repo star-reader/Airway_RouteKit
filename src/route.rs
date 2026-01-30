@@ -123,21 +123,21 @@ impl AirwayGraph {
     }
     
     /// 通过名称查找最近的节点（用于SID/STAR入口点匹配）
-    fn find_nearest_node(&self, identifier: &str, near_coord: &Coordinate) -> Option<usize> {
-        let mut best_idx: Option<usize> = None;
-        let mut best_dist = f64::INFINITY;
+    // fn find_nearest_node(&self, identifier: &str, near_coord: &Coordinate) -> Option<usize> {
+    //     let mut best_idx: Option<usize> = None;
+    //     let mut best_dist = f64::INFINITY;
         
-        for (idx, (name, coord)) in self.nodes.iter().enumerate() {
-            if name == identifier {
-                let dist = haversine_distance_nm(near_coord, coord);
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_idx = Some(idx);
-                }
-            }
-        }
-        best_idx
-    }
+    //     for (idx, (name, coord)) in self.nodes.iter().enumerate() {
+    //         if name == identifier {
+    //             let dist = haversine_distance_nm(near_coord, coord);
+    //             if dist < best_dist {
+    //                 best_dist = dist;
+    //                 best_idx = Some(idx);
+    //             }
+    //         }
+    //     }
+    //     best_idx
+    // }
 }
 
 /// 航路搜索器
