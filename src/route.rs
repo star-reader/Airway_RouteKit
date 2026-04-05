@@ -122,7 +122,6 @@ impl AirwayGraph {
         self.node_index.get(&key).copied()
     }
     
-    /// 通过名称查找最近的节点（用于SID/STAR入口点匹配）
     // fn find_nearest_node(&self, identifier: &str, near_coord: &Coordinate) -> Option<usize> {
     //     let mut best_idx: Option<usize> = None;
     //     let mut best_dist = f64::INFINITY;
