@@ -1,5 +1,6 @@
 use crate::database::DatabasePool;
 use crate::error::Result;
+use crate::geo::haversine_distance_nm;
 use crate::models::*;
 use crate::utils::*;
 use lazy_static::lazy_static;
@@ -91,6 +92,8 @@ impl RouteParser {
         let mut i = 0;
         let mut last_waypoint: Option<Waypoint> = None;
         let mut expecting_destination = false;
+        let mut departure_region: Option<String> = None;
+        let mut destination_region: Option<String> = None;
 
         while i < tokens.len() {
             let token = &tokens[i];
@@ -109,6 +112,7 @@ impl RouteParser {
             if parsed.departure.is_none() && self.is_airport_code(&token_upper) {
                 match self.db_pool.load_airport(&token_upper) {
                     Ok(airport) => {
+                        departure_region = Self::airport_region_code(&airport.identifier);
                         parsed.departure = Some(airport);
                     }
                     Err(_) => {
@@ -154,7 +158,12 @@ impl RouteParser {
                     // 下一个应该是航点
                     if i + 1 < tokens.len() {
                         i += 1;
-                        if let Some(to_wp) = self.try_find_waypoint(&tokens[i])? {
+                        if let Some(to_wp) = self.pick_waypoint_candidate(
+                            &tokens[i],
+                            &last_waypoint,
+                            departure_region.as_deref(),
+                            destination_region.as_deref(),
+                        )? {
                             parsed.elements.push(RouteElement::Direct {
                                 from: from_wp.clone(),
                                 to: to_wp.clone(),
@@ -190,11 +199,24 @@ impl RouteParser {
                 // 获取航路的所有航段
                 if let Ok(all_segments) = self.db_pool.find_airway_segments(&token_upper) {
                     if !all_segments.is_empty() {
+                        let to_waypoint_hint = to_waypoint_id
+                            .as_deref()
+                            .and_then(|id| self.pick_waypoint_candidate(
+                                id,
+                                &last_waypoint,
+                                departure_region.as_deref(),
+                                destination_region.as_deref(),
+                            ).ok())
+                            .flatten();
+
                         // 截取从 from_waypoint 到 to_waypoint 之间的航段
                         let filtered_segments = self.extract_airway_segment(
-                            &all_segments, 
-                            from_waypoint_id.as_deref(), 
-                            to_waypoint_id.as_deref()
+                            &all_segments,
+                            last_waypoint.as_ref(),
+                            to_waypoint_id.as_deref(),
+                            to_waypoint_hint.as_ref(),
+                            departure_region.as_deref(),
+                            destination_region.as_deref(),
                         );
                         
                         if !filtered_segments.is_empty() {
@@ -222,7 +244,12 @@ impl RouteParser {
             }
 
             // 处理航点
-            if let Some(waypoint) = self.try_find_waypoint(&token_upper)? {
+            if let Some(waypoint) = self.pick_waypoint_candidate(
+                &token_upper,
+                &last_waypoint,
+                departure_region.as_deref(),
+                destination_region.as_deref(),
+            )? {
                 parsed.elements.push(RouteElement::Waypoint(waypoint.clone()));
                 last_waypoint = Some(waypoint);
                 i += 1;
@@ -233,6 +260,7 @@ impl RouteParser {
             if self.is_airport_code(&token_upper) && (expecting_destination || i == tokens.len() - 1) {
                 match self.db_pool.load_airport(&token_upper) {
                     Ok(airport) => {
+                        destination_region = Self::airport_region_code(&airport.identifier);
                         parsed.destination = Some(airport);
                     }
                     Err(_) => {
@@ -272,6 +300,85 @@ impl RouteParser {
         self.db_pool.find_waypoint(identifier)
     }
 
+    fn pick_waypoint_candidate(
+        &self,
+        identifier: &str,
+        prev_waypoint: &Option<Waypoint>,
+        departure_region: Option<&str>,
+        destination_region: Option<&str>,
+    ) -> Result<Option<Waypoint>> {
+        let candidates = self.db_pool.find_waypoints(identifier)?;
+        Ok(self.select_best_waypoint(
+            candidates,
+            prev_waypoint.as_ref(),
+            departure_region,
+            destination_region,
+        ))
+    }
+
+    fn airport_region_code(icao: &str) -> Option<String> {
+        if icao.len() >= 2 {
+            Some(icao[..2].to_string())
+        } else {
+            None
+        }
+    }
+
+    fn select_best_waypoint(
+        &self,
+        candidates: Vec<Waypoint>,
+        prev_waypoint: Option<&Waypoint>,
+        departure_region: Option<&str>,
+        destination_region: Option<&str>,
+    ) -> Option<Waypoint> {
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1 {
+            return candidates.into_iter().next();
+        }
+
+        let mut best: Option<(f64, Waypoint)> = None;
+        for candidate in candidates {
+            let mut score = 0.0;
+
+            if let Some(prev) = prev_waypoint {
+                let dist = haversine_distance_nm(&prev.coordinate, &candidate.coordinate);
+                score += dist.min(6000.0);
+                if !prev.icao_code.is_empty() && prev.icao_code == candidate.icao_code {
+                    score -= 250.0;
+                }
+            }
+
+            if let Some(dest_region) = destination_region {
+                if !candidate.icao_code.is_empty() && candidate.icao_code == dest_region {
+                    score -= 180.0;
+                }
+            }
+
+            if let Some(dep_region) = departure_region {
+                if !candidate.icao_code.is_empty() && candidate.icao_code == dep_region {
+                    score -= 120.0;
+                }
+            }
+
+            if !matches!(candidate.waypoint_type, WaypointType::Enroute) {
+                score += 75.0;
+            }
+
+            match &mut best {
+                Some((best_score, best_wp)) if score < *best_score => {
+                    *best_score = score;
+                    *best_wp = candidate;
+                }
+                None => best = Some((score, candidate)),
+                _ => {}
+            }
+        }
+
+        best.map(|(_, wp)| wp)
+    }
+
     /// 提取程序名称
     fn extract_procedure_name(&self, token: &str, proc_type: &str) -> Option<String> {
         // 移除 "SID" 或 "STAR" 后缀
@@ -291,8 +398,11 @@ impl RouteParser {
     fn extract_airway_segment(
         &self,
         segments: &[AirwaySegment],
-        from_waypoint: Option<&str>,
+        from_waypoint: Option<&Waypoint>,
         to_waypoint: Option<&str>,
+        to_waypoint_hint: Option<&Waypoint>,
+        departure_region: Option<&str>,
+        destination_region: Option<&str>,
     ) -> Vec<AirwaySegment> {
         if segments.is_empty() {
             return vec![];
@@ -300,11 +410,23 @@ impl RouteParser {
 
         // 找出 from_waypoint 和 to_waypoint 在航路中的位置（索引）
         let from_idx = from_waypoint.and_then(|from| {
-            segments.iter().position(|seg| seg.waypoint.identifier.eq_ignore_ascii_case(from))
+            self.select_best_segment_index(
+                segments,
+                &from.identifier,
+                Some(from),
+                departure_region,
+                destination_region,
+            )
         });
-        
+
         let to_idx = to_waypoint.and_then(|to| {
-            segments.iter().position(|seg| seg.waypoint.identifier.eq_ignore_ascii_case(to))
+            self.select_best_segment_index(
+                segments,
+                to,
+                to_waypoint_hint,
+                departure_region,
+                destination_region,
+            )
         });
 
         match (from_idx, to_idx) {
@@ -331,6 +453,67 @@ impl RouteParser {
                 segments.to_vec()
             }
         }
+    }
+
+    fn select_best_segment_index(
+        &self,
+        segments: &[AirwaySegment],
+        identifier: &str,
+        waypoint_hint: Option<&Waypoint>,
+        departure_region: Option<&str>,
+        destination_region: Option<&str>,
+    ) -> Option<usize> {
+        let mut matches: Vec<usize> = segments
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, seg)| {
+                if seg.waypoint.identifier.eq_ignore_ascii_case(identifier) {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if matches.is_empty() {
+            return None;
+        }
+        if matches.len() == 1 {
+            return matches.pop();
+        }
+
+        let mut best: Option<(f64, usize)> = None;
+        for idx in matches {
+            let seg_wp = &segments[idx].waypoint;
+            let mut score = 0.0;
+
+            if let Some(hint) = waypoint_hint {
+                let dist = haversine_distance_nm(&hint.coordinate, &seg_wp.coordinate);
+                score += dist.min(6000.0);
+                if !hint.icao_code.is_empty() && hint.icao_code == seg_wp.icao_code {
+                    score -= 250.0;
+                }
+            }
+
+            if let Some(dest_region) = destination_region {
+                if !seg_wp.icao_code.is_empty() && seg_wp.icao_code == dest_region {
+                    score -= 180.0;
+                }
+            }
+
+            if let Some(dep_region) = departure_region {
+                if !seg_wp.icao_code.is_empty() && seg_wp.icao_code == dep_region {
+                    score -= 120.0;
+                }
+            }
+
+            match best {
+                Some((best_score, _)) if score >= best_score => {}
+                _ => best = Some((score, idx)),
+            }
+        }
+
+        best.map(|(_, idx)| idx)
     }
 
     /// 解析自由格式的航路字符串（高容错性）
