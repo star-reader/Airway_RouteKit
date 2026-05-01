@@ -87,23 +87,29 @@ impl DatabasePool {
     }
 
     pub fn find_waypoint(&self, identifier: &str) -> Result<Option<Waypoint>> {
+        let candidates = self.find_waypoints(identifier)?;
+        Ok(candidates.into_iter().next())
+    }
+
+    pub fn find_waypoints(&self, identifier: &str) -> Result<Vec<Waypoint>> {
         let conn = self.get_connection()?;
-        
-        // 先在航路航点中查找
+
+        let mut waypoints = Vec::new();
+
+        // 先在航路航点中查找（可能存在重名航点）
         let mut stmt = conn.prepare(
             "SELECT waypoint_identifier, icao_code, waypoint_name, 
                     waypoint_latitude, waypoint_longitude, waypoint_type, 
                     waypoint_usage, id
              FROM tbl_enroute_waypoints 
-             WHERE waypoint_identifier = ?1 
-             LIMIT 1"
+             WHERE waypoint_identifier = ?1"
         )?;
 
-        let waypoint = stmt
-            .query_row(params![identifier], |row| {
+        let enroute_waypoints = stmt
+            .query_map(params![identifier], |row| {
                 let lat: f64 = row.get(3)?;
                 let lon: f64 = row.get(4)?;
-                
+
                 Ok(Waypoint {
                     identifier: row.get::<_, String>(0)?,
                     icao_code: row.get::<_, String>(1).unwrap_or_default(),
@@ -114,27 +120,24 @@ impl DatabasePool {
                     usage: row.get::<_, Option<String>>(6)?,
                     id: row.get::<_, Option<String>>(7)?,
                 })
-            })
-            .optional()?;
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        if waypoint.is_some() {
-            return Ok(waypoint);
-        }
+        waypoints.extend(enroute_waypoints);
 
-        // 在终端区航点中查找
+        // 在终端区航点中查找（补充候选）
         let mut stmt = conn.prepare(
             "SELECT waypoint_identifier, icao_code, waypoint_name, 
                     waypoint_latitude, waypoint_longitude, id
              FROM tbl_terminal_waypoints 
-             WHERE waypoint_identifier = ?1 
-             LIMIT 1"
+             WHERE waypoint_identifier = ?1"
         )?;
 
-        let waypoint = stmt
-            .query_row(params![identifier], |row| {
+        let terminal_waypoints = stmt
+            .query_map(params![identifier], |row| {
                 let lat: f64 = row.get(3)?;
                 let lon: f64 = row.get(4)?;
-                
+
                 Ok(Waypoint {
                     identifier: row.get::<_, String>(0)?,
                     icao_code: row.get::<_, String>(1).unwrap_or_default(),
@@ -145,10 +148,11 @@ impl DatabasePool {
                     usage: None,
                     id: row.get::<_, Option<String>>(5)?,
                 })
-            })
-            .optional()?;
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        Ok(waypoint)
+        waypoints.extend(terminal_waypoints);
+        Ok(waypoints)
     }
 
     /// 查找航路段
