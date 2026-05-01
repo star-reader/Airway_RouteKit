@@ -58,6 +58,33 @@ fn setup_parser_db() -> NamedTempFile {
             inbound_course REAL,
             inbound_distance REAL
         );
+
+        CREATE TABLE tbl_vor (
+            identifier TEXT,
+            icao_code TEXT,
+            name TEXT,
+            latitude REAL,
+            longitude REAL,
+            id TEXT
+        );
+
+        CREATE TABLE tbl_enroute_ndb (
+            identifier TEXT,
+            icao_code TEXT,
+            name TEXT,
+            latitude REAL,
+            longitude REAL,
+            id TEXT
+        );
+
+        CREATE TABLE tbl_terminal_ndb (
+            identifier TEXT,
+            icao_code TEXT,
+            name TEXT,
+            latitude REAL,
+            longitude REAL,
+            id TEXT
+        );
         "#,
     )
     .expect("create tables");
@@ -81,6 +108,7 @@ fn setup_parser_db() -> NamedTempFile {
     // 重名航点 AND：一个中国、一个挪威
     insert_wp(&conn, "AND", "ZS", 30.25666667, 121.22166667, "Enroute");
     insert_wp(&conn, "AND", "EN", 69.28782778, 16.14137778, "VOR");
+    insert_vor(&conn, "AND", "ZS", "AND VOR", 30.25666667, 121.22166667);
 
     // B221：故意放入两个 AND（不同坐标）验证航路内部歧义选择
     insert_airway_seg(&conn, "B221", 10, "SUPAR", 30.80, 121.00, "ZS");
@@ -92,6 +120,10 @@ fn setup_parser_db() -> NamedTempFile {
     insert_airway_seg(&conn, "W90", 10, "TEPID", 30.90, 121.10, "ZS");
     insert_airway_seg(&conn, "W90", 20, "MULOV", 30.95, 121.15, "ZS");
     insert_airway_seg(&conn, "W90", 30, "SUPAR", 30.80, 121.00, "ZS");
+
+    // 仅存在于NDB表，不存在于waypoints表，用于验证回退读取
+    insert_enroute_ndb(&conn, "NDBA", "ZS", "NDB A", 31.00, 121.30);
+    insert_terminal_ndb(&conn, "NDBT", "ZS", "NDB T", 31.10, 121.40);
 
     tmp
 }
@@ -113,6 +145,33 @@ fn insert_airway_seg(conn: &Connection, route: &str, seqno: i32, id: &str, lat: 
           flightlevel, direction_restriction, minimum_altitude1, minimum_altitude2, maximum_altitude, outbound_course, inbound_course, inbound_distance)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'R', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
         params![route, seqno, id, lat, lon, icao],
+    )
+    .unwrap();
+}
+
+fn insert_vor(conn: &Connection, id: &str, icao: &str, name: &str, lat: f64, lon: f64) {
+    conn.execute(
+        "INSERT INTO tbl_vor (identifier, icao_code, name, latitude, longitude, id)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        params![id, icao, name, lat, lon],
+    )
+    .unwrap();
+}
+
+fn insert_enroute_ndb(conn: &Connection, id: &str, icao: &str, name: &str, lat: f64, lon: f64) {
+    conn.execute(
+        "INSERT INTO tbl_enroute_ndb (identifier, icao_code, name, latitude, longitude, id)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        params![id, icao, name, lat, lon],
+    )
+    .unwrap();
+}
+
+fn insert_terminal_ndb(conn: &Connection, id: &str, icao: &str, name: &str, lat: f64, lon: f64) {
+    conn.execute(
+        "INSERT INTO tbl_terminal_ndb (identifier, icao_code, name, latitude, longitude, id)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+        params![id, icao, name, lat, lon],
     )
     .unwrap();
 }
@@ -183,4 +242,58 @@ fn test_unknown_waypoint_kept_as_unknown_token() {
         .iter()
         .any(|e| matches!(e, RouteElement::Unknown(x) if x == "NOTEXIST"));
     assert!(has_unknown);
+}
+
+#[test]
+fn test_vor_is_loaded_as_waypoint_candidate() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR DCT AND").expect("parse");
+    let direct_to = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Direct { to, .. } => Some(to.clone()),
+        _ => None,
+    });
+
+    let to = direct_to.expect("should produce DCT segment");
+    assert_eq!(to.identifier, "AND");
+    // Because enroute and VOR both exist for AND, this ensures the parser still resolves it successfully.
+    assert!(matches!(to.waypoint_type, routekit::WaypointType::Enroute | routekit::WaypointType::VOR));
+}
+
+#[test]
+fn test_ndb_tables_are_used_for_waypoint_resolution() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("ZGGG SID NDBA NDBT ZSPD").expect("parse");
+    let ndb_waypoints: Vec<_> = parsed
+        .elements
+        .iter()
+        .filter_map(|e| match e {
+            RouteElement::Waypoint(wp) if wp.identifier == "NDBA" || wp.identifier == "NDBT" => Some(wp.clone()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(ndb_waypoints.len(), 2);
+    assert!(ndb_waypoints
+        .iter()
+        .all(|wp| matches!(wp.waypoint_type, routekit::WaypointType::NDB)));
+}
+
+#[test]
+fn test_airway_endpoint_token_is_not_reparsed_as_unknown() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit
+        .parse_route("ZGGG TAN W24 TEPID W90 NOLON A599 ELNEX G204 MULOV V73 SUPAR B221 AND ZSPD")
+        .expect("parse");
+
+    let has_and_unknown = parsed
+        .warnings
+        .iter()
+        .any(|w| w.contains("无法识别的元素: AND"));
+    assert!(!has_and_unknown, "AND should be consumed by airway endpoint, got warnings: {:?}", parsed.warnings);
 }

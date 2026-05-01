@@ -152,7 +152,80 @@ impl DatabasePool {
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         waypoints.extend(terminal_waypoints);
+
+        // VOR 表
+        self.extend_waypoints_from_navaid_table(
+            &conn,
+            &mut waypoints,
+            "tbl_vor",
+            identifier,
+            WaypointType::VOR,
+        )?;
+
+        // NDB 表
+        self.extend_waypoints_from_navaid_table(
+            &conn,
+            &mut waypoints,
+            "tbl_enroute_ndb",
+            identifier,
+            WaypointType::NDB,
+        )?;
+        self.extend_waypoints_from_navaid_table(
+            &conn,
+            &mut waypoints,
+            "tbl_terminal_ndb",
+            identifier,
+            WaypointType::NDB,
+        )?;
+
         Ok(waypoints)
+    }
+
+    fn extend_waypoints_from_navaid_table(
+        &self,
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        waypoints: &mut Vec<Waypoint>,
+        table_name: &str,
+        identifier: &str,
+        waypoint_type: WaypointType,
+    ) -> Result<()> {
+        let query = format!(
+            "SELECT identifier, icao_code, name, latitude, longitude, id
+             FROM {table}
+             WHERE identifier = ?1",
+            table = table_name
+        );
+
+        let mut stmt = match conn.prepare(&query) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("no such table") {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
+        let found = stmt
+            .query_map(params![identifier], |row| {
+                let lat: f64 = row.get(3)?;
+                let lon: f64 = row.get(4)?;
+                Ok(Waypoint {
+                    identifier: row.get::<_, String>(0)?,
+                    icao_code: row.get::<_, String>(1).unwrap_or_default(),
+                    name: row.get::<_, Option<String>>(2)?,
+                    coordinate: Coordinate::new(lat, lon)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    waypoint_type: waypoint_type.clone(),
+                    usage: None,
+                    id: row.get::<_, Option<String>>(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        waypoints.extend(found);
+        Ok(())
     }
 
     /// 查找航路段
