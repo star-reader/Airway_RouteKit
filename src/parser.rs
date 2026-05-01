@@ -196,6 +196,7 @@ impl RouteParser {
                     None
                 };
                 
+                let mut consumed_to_waypoint_token = false;
                 // 获取航路的所有航段
                 if let Ok(all_segments) = self.db_pool.find_airway_segments(&token_upper) {
                     if !all_segments.is_empty() {
@@ -227,6 +228,14 @@ impl RouteParser {
                             if let Some(last_seg) = filtered_segments.last() {
                                 last_waypoint = Some(last_seg.waypoint.clone());
                             }
+                            if let (Some(to_id), Some(last_seg)) =
+                                (to_waypoint_id.as_deref(), filtered_segments.last())
+                            {
+                                // 航路已明确到达下一个航点token，避免后续重复解析并产生Unknown警告
+                                if last_seg.waypoint.identifier.eq_ignore_ascii_case(to_id) {
+                                    consumed_to_waypoint_token = true;
+                                }
+                            }
                         } else {
                             parsed.warnings.push(format!(
                                 "航路 {} 中未找到从 {:?} 到 {:?} 的航段", 
@@ -239,7 +248,11 @@ impl RouteParser {
                 } else {
                     parsed.warnings.push(format!("航路 {} 未在数据库中找到", token_upper));
                 }
-                i += 1;
+                if consumed_to_waypoint_token && i + 1 < tokens.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
                 continue;
             }
 
