@@ -30,6 +30,8 @@ pub struct RouteParser {
 }
 
 impl RouteParser {
+    const MAX_WAYPOINT_HOP_NM: f64 = 800.0;
+
     pub fn new(db_pool: Arc<DatabasePool>) -> Self {
         Self { db_pool }
     }
@@ -131,8 +133,8 @@ impl RouteParser {
                 continue;
             }
 
-            // 处理SID
-            if token_upper.contains("SID") || (parsed.departure.is_some() && parsed.sid.is_none()) {
+            // 处理SID（仅当明确包含SID关键字时）
+            if token_upper.contains("SID") {
                 if let Some(sid_name) = self.extract_procedure_name(&token_upper, "SID") {
                     parsed.sid = Some(sid_name.clone());
                     parsed.elements.push(RouteElement::SID(sid_name));
@@ -161,6 +163,7 @@ impl RouteParser {
                         if let Some(to_wp) = self.pick_waypoint_candidate(
                             &tokens[i],
                             &last_waypoint,
+                            parsed.departure.as_ref(),
                             departure_region.as_deref(),
                             destination_region.as_deref(),
                         )? {
@@ -205,6 +208,7 @@ impl RouteParser {
                             .and_then(|id| self.pick_waypoint_candidate(
                                 id,
                                 &last_waypoint,
+                                parsed.departure.as_ref(),
                                 departure_region.as_deref(),
                                 destination_region.as_deref(),
                             ).ok())
@@ -260,6 +264,7 @@ impl RouteParser {
             if let Some(waypoint) = self.pick_waypoint_candidate(
                 &token_upper,
                 &last_waypoint,
+                parsed.departure.as_ref(),
                 departure_region.as_deref(),
                 destination_region.as_deref(),
             )? {
@@ -267,6 +272,15 @@ impl RouteParser {
                 last_waypoint = Some(waypoint);
                 i += 1;
                 continue;
+            }
+
+            // 对于机场后紧随的首个疑似航点，如果候选都过远，给出更明确warning
+            if parsed.departure.is_some()
+                && last_waypoint.is_none()
+                && !self.is_airport_code(&token_upper)
+                && !AIRWAY_PATTERN.is_match(&token_upper)
+            {
+                parsed.warnings.push(format!("航点 {} 距离起飞机场过远，已忽略", token_upper));
             }
 
             // 最后尝试作为目的机场
@@ -317,6 +331,7 @@ impl RouteParser {
         &self,
         identifier: &str,
         prev_waypoint: &Option<Waypoint>,
+        departure_airport: Option<&Airport>,
         departure_region: Option<&str>,
         destination_region: Option<&str>,
     ) -> Result<Option<Waypoint>> {
@@ -324,6 +339,7 @@ impl RouteParser {
         Ok(self.select_best_waypoint(
             candidates,
             prev_waypoint.as_ref(),
+            departure_airport,
             departure_region,
             destination_region,
         ))
@@ -341,6 +357,7 @@ impl RouteParser {
         &self,
         candidates: Vec<Waypoint>,
         prev_waypoint: Option<&Waypoint>,
+        departure_airport: Option<&Airport>,
         departure_region: Option<&str>,
         destination_region: Option<&str>,
     ) -> Option<Waypoint> {
@@ -352,14 +369,33 @@ impl RouteParser {
         }
 
         let mut best: Option<(f64, Waypoint)> = None;
+        let anchor_coord = prev_waypoint
+            .map(|wp| wp.coordinate)
+            .or_else(|| departure_airport.map(|ap| ap.coordinate));
+        let anchor_region = prev_waypoint
+            .map(|wp| wp.icao_code.as_str())
+            .or(departure_region);
+
         for candidate in candidates {
             let mut score = 0.0;
 
-            if let Some(prev) = prev_waypoint {
-                let dist = haversine_distance_nm(&prev.coordinate, &candidate.coordinate);
+            if let Some(anchor) = anchor_coord {
+                let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
                 score += dist.min(6000.0);
-                if !prev.icao_code.is_empty() && prev.icao_code == candidate.icao_code {
-                    score -= 250.0;
+                if let Some(region) = anchor_region {
+                    if !candidate.icao_code.is_empty() && candidate.icao_code == region {
+                        score -= 300.0;
+                    }
+                }
+
+                // 距离过远且区域不一致时强惩罚，避免跳到同名异地台站
+                if dist > Self::MAX_WAYPOINT_HOP_NM {
+                    let same_region = anchor_region
+                        .map(|r| !candidate.icao_code.is_empty() && candidate.icao_code == r)
+                        .unwrap_or(false);
+                    if !same_region {
+                        score += 20000.0;
+                    }
                 }
             }
 
@@ -371,7 +407,7 @@ impl RouteParser {
 
             if let Some(dep_region) = departure_region {
                 if !candidate.icao_code.is_empty() && candidate.icao_code == dep_region {
-                    score -= 120.0;
+                    score -= 160.0;
                 }
             }
 
@@ -389,7 +425,22 @@ impl RouteParser {
             }
         }
 
-        best.map(|(_, wp)| wp)
+        let selected = best.map(|(_, wp)| wp)?;
+
+        // 最终兜底：若相对锚点过远且区域不一致，放弃解析（上层会给warning/unknown）
+        if let Some(anchor) = anchor_coord {
+            let dist = haversine_distance_nm(&anchor, &selected.coordinate);
+            if dist > Self::MAX_WAYPOINT_HOP_NM {
+                let same_region = anchor_region
+                    .map(|r| !selected.icao_code.is_empty() && selected.icao_code == r)
+                    .unwrap_or(false);
+                if !same_region {
+                    return None;
+                }
+            }
+        }
+
+        Some(selected)
     }
 
     /// 提取程序名称

@@ -99,16 +99,31 @@ fn setup_parser_db() -> NamedTempFile {
         params!["ZSPD", "ZSPD", 31.1434_f64, 121.8052_f64],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO tbl_airports VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, NULL, NULL, NULL)",
+        params!["ZYHB", "ZYHB", 45.6234_f64, 126.2503_f64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tbl_airports VALUES (?1, ?2, NULL, NULL, ?3, ?4, NULL, NULL, NULL, NULL)",
+        params!["ZUCK", "ZUCK", 30.5785_f64, 103.9471_f64],
+    )
+    .unwrap();
 
     // 唯一航点
     insert_wp(&conn, "SUPAR", "ZS", 30.80, 121.00, "Enroute");
     insert_wp(&conn, "TEPID", "ZS", 30.90, 121.10, "Enroute");
     insert_wp(&conn, "MULOV", "ZS", 30.95, 121.15, "Enroute");
+    insert_wp(&conn, "HRB", "ZY", 45.70, 126.30, "Enroute");
+    insert_wp(&conn, "NODAL", "ZY", 40.04638889, 123.17805556, "Enroute");
+    insert_wp(&conn, "VENOS", "ZY", 38.90277778, 122.32666667, "Enroute");
 
     // 重名航点 AND：一个中国、一个挪威
     insert_wp(&conn, "AND", "ZS", 30.25666667, 121.22166667, "Enroute");
     insert_wp(&conn, "AND", "EN", 69.28782778, 16.14137778, "VOR");
     insert_vor(&conn, "AND", "ZS", "AND VOR", 30.25666667, 121.22166667);
+    insert_wp(&conn, "CHI", "ZY", 39.20, 122.90, "Enroute");
+    insert_wp(&conn, "CHI", "YB", -12.55, 130.86666667, "Enroute");
 
     // B221：故意放入两个 AND（不同坐标）验证航路内部歧义选择
     insert_airway_seg(&conn, "B221", 10, "SUPAR", 30.80, 121.00, "ZS");
@@ -296,4 +311,40 @@ fn test_airway_endpoint_token_is_not_reparsed_as_unknown() {
         .iter()
         .any(|w| w.contains("无法识别的元素: AND"));
     assert!(!has_and_unknown, "AND should be consumed by airway endpoint, got warnings: {:?}", parsed.warnings);
+}
+
+#[test]
+fn test_first_token_after_departure_is_not_forced_sid() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("ZYHB HRB NODAL VENOS ZUCK").expect("parse");
+
+    let has_sid = parsed
+        .elements
+        .iter()
+        .any(|e| matches!(e, RouteElement::SID(_)));
+    assert!(!has_sid, "HRB should be parsed as waypoint, not SID");
+
+    let first_wp = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Waypoint(wp) => Some(wp.identifier.clone()),
+        _ => None,
+    });
+    assert_eq!(first_wp.as_deref(), Some("HRB"));
+}
+
+#[test]
+fn test_duplicate_identifier_prefers_local_continuity_over_far_region() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("ZYHB HRB NODAL CHI VENOS ZUCK").expect("parse");
+    let chi_wp = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Waypoint(wp) if wp.identifier == "CHI" => Some(wp.clone()),
+        _ => None,
+    });
+
+    let chi = chi_wp.expect("CHI should be parsed");
+    assert_eq!(chi.icao_code, "ZY");
+    assert!(chi.coordinate.latitude > 0.0, "should not jump to YB/Channel Island candidate");
 }
