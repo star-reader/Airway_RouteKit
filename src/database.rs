@@ -153,46 +153,30 @@ impl DatabasePool {
 
         waypoints.extend(terminal_waypoints);
 
-        // VOR 表
-        self.extend_waypoints_from_navaid_table(
-            &conn,
-            &mut waypoints,
-            "tbl_vor",
-            identifier,
-            WaypointType::VOR,
-        )?;
+        // VOR/VHF 台站（真实表：tbl_vhfnavaids；兼容旧表名：tbl_vor）
+        self.extend_waypoints_from_vhf_table(&conn, &mut waypoints, "tbl_vhfnavaids", identifier)?;
+        self.extend_waypoints_from_vhf_table(&conn, &mut waypoints, "tbl_vor", identifier)?;
 
-        // NDB 表
-        self.extend_waypoints_from_navaid_table(
-            &conn,
-            &mut waypoints,
-            "tbl_enroute_ndb",
-            identifier,
-            WaypointType::NDB,
-        )?;
-        self.extend_waypoints_from_navaid_table(
-            &conn,
-            &mut waypoints,
-            "tbl_terminal_ndb",
-            identifier,
-            WaypointType::NDB,
-        )?;
+        // NDB 台站（真实表：tbl_*_ndbnavaids；兼容旧表名：tbl_*_ndb）
+        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_enroute_ndbnavaids", identifier)?;
+        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_terminal_ndbnavaids", identifier)?;
+        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_enroute_ndb", identifier)?;
+        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_terminal_ndb", identifier)?;
 
         Ok(waypoints)
     }
 
-    fn extend_waypoints_from_navaid_table(
+    fn extend_waypoints_from_vhf_table(
         &self,
         conn: &r2d2::PooledConnection<SqliteConnectionManager>,
         waypoints: &mut Vec<Waypoint>,
         table_name: &str,
         identifier: &str,
-        waypoint_type: WaypointType,
     ) -> Result<()> {
         let query = format!(
-            "SELECT identifier, icao_code, name, latitude, longitude, id
+            "SELECT vor_identifier, icao_code, vor_name, vor_latitude, vor_longitude, id
              FROM {table}
-             WHERE identifier = ?1",
+             WHERE vor_identifier = ?1",
             table = table_name
         );
 
@@ -217,7 +201,53 @@ impl DatabasePool {
                     name: row.get::<_, Option<String>>(2)?,
                     coordinate: Coordinate::new(lat, lon)
                         .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    waypoint_type: waypoint_type.clone(),
+                    waypoint_type: WaypointType::VOR,
+                    usage: None,
+                    id: row.get::<_, Option<String>>(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        waypoints.extend(found);
+        Ok(())
+    }
+
+    fn extend_waypoints_from_ndb_table(
+        &self,
+        conn: &r2d2::PooledConnection<SqliteConnectionManager>,
+        waypoints: &mut Vec<Waypoint>,
+        table_name: &str,
+        identifier: &str,
+    ) -> Result<()> {
+        let query = format!(
+            "SELECT ndb_identifier, icao_code, ndb_name, ndb_latitude, ndb_longitude, id
+             FROM {table}
+             WHERE ndb_identifier = ?1",
+            table = table_name
+        );
+
+        let mut stmt = match conn.prepare(&query) {
+            Ok(stmt) => stmt,
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                if msg.contains("no such table") {
+                    return Ok(());
+                }
+                return Err(e.into());
+            }
+        };
+
+        let found = stmt
+            .query_map(params![identifier], |row| {
+                let lat: f64 = row.get(3)?;
+                let lon: f64 = row.get(4)?;
+                Ok(Waypoint {
+                    identifier: row.get::<_, String>(0)?,
+                    icao_code: row.get::<_, String>(1).unwrap_or_default(),
+                    name: row.get::<_, Option<String>>(2)?,
+                    coordinate: Coordinate::new(lat, lon)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    waypoint_type: WaypointType::NDB,
                     usage: None,
                     id: row.get::<_, Option<String>>(5)?,
                 })

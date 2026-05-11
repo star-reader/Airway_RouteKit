@@ -59,30 +59,51 @@ fn setup_parser_db() -> NamedTempFile {
             inbound_distance REAL
         );
 
-        CREATE TABLE tbl_vor (
-            identifier TEXT,
+        CREATE TABLE tbl_vhfnavaids (
+            area_code TEXT,
+            airport_identifier TEXT,
             icao_code TEXT,
-            name TEXT,
-            latitude REAL,
-            longitude REAL,
+            vor_identifier TEXT,
+            vor_name TEXT,
+            vor_frequency REAL,
+            navaid_class TEXT,
+            vor_latitude REAL,
+            vor_longitude REAL,
+            dme_ident TEXT,
+            dme_latitude REAL,
+            dme_longitude REAL,
+            dme_elevation INTEGER,
+            ilsdme_bias REAL,
+            range INTEGER,
+            station_declination REAL,
+            magnetic_variation REAL,
             id TEXT
         );
 
-        CREATE TABLE tbl_enroute_ndb (
-            identifier TEXT,
+        CREATE TABLE tbl_enroute_ndbnavaids (
+            area_code TEXT,
             icao_code TEXT,
-            name TEXT,
-            latitude REAL,
-            longitude REAL,
+            ndb_identifier TEXT,
+            ndb_name TEXT,
+            ndb_frequency REAL,
+            navaid_class TEXT,
+            ndb_latitude REAL,
+            ndb_longitude REAL,
+            range INTEGER,
             id TEXT
         );
 
-        CREATE TABLE tbl_terminal_ndb (
-            identifier TEXT,
+        CREATE TABLE tbl_terminal_ndbnavaids (
+            area_code TEXT,
+            airport_identifier TEXT,
             icao_code TEXT,
-            name TEXT,
-            latitude REAL,
-            longitude REAL,
+            ndb_identifier TEXT,
+            ndb_name TEXT,
+            ndb_frequency REAL,
+            navaid_class TEXT,
+            ndb_latitude REAL,
+            ndb_longitude REAL,
+            range INTEGER,
             id TEXT
         );
         "#,
@@ -166,27 +187,32 @@ fn insert_airway_seg(conn: &Connection, route: &str, seqno: i32, id: &str, lat: 
 
 fn insert_vor(conn: &Connection, id: &str, icao: &str, name: &str, lat: f64, lon: f64) {
     conn.execute(
-        "INSERT INTO tbl_vor (identifier, icao_code, name, latitude, longitude, id)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-        params![id, icao, name, lat, lon],
+        "INSERT INTO tbl_vhfnavaids
+         (area_code, airport_identifier, icao_code, vor_identifier, vor_name, vor_frequency, navaid_class,
+          vor_latitude, vor_longitude, dme_ident, dme_latitude, dme_longitude, dme_elevation,
+          ilsdme_bias, range, station_declination, magnetic_variation, id)
+         VALUES ('ZZ', NULL, ?1, ?2, ?3, NULL, NULL, ?4, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+        params![icao, id, name, lat, lon],
     )
     .unwrap();
 }
 
 fn insert_enroute_ndb(conn: &Connection, id: &str, icao: &str, name: &str, lat: f64, lon: f64) {
     conn.execute(
-        "INSERT INTO tbl_enroute_ndb (identifier, icao_code, name, latitude, longitude, id)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-        params![id, icao, name, lat, lon],
+        "INSERT INTO tbl_enroute_ndbnavaids
+         (area_code, icao_code, ndb_identifier, ndb_name, ndb_frequency, navaid_class, ndb_latitude, ndb_longitude, range, id)
+         VALUES ('ZZ', ?1, ?2, ?3, NULL, NULL, ?4, ?5, NULL, NULL)",
+        params![icao, id, name, lat, lon],
     )
     .unwrap();
 }
 
 fn insert_terminal_ndb(conn: &Connection, id: &str, icao: &str, name: &str, lat: f64, lon: f64) {
     conn.execute(
-        "INSERT INTO tbl_terminal_ndb (identifier, icao_code, name, latitude, longitude, id)
-         VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-        params![id, icao, name, lat, lon],
+        "INSERT INTO tbl_terminal_ndbnavaids
+         (area_code, airport_identifier, icao_code, ndb_identifier, ndb_name, ndb_frequency, navaid_class, ndb_latitude, ndb_longitude, range, id)
+         VALUES ('ZZ', NULL, ?1, ?2, ?3, NULL, NULL, ?4, ?5, NULL, NULL)",
+        params![icao, id, name, lat, lon],
     )
     .unwrap();
 }

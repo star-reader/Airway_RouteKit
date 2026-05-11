@@ -30,7 +30,8 @@ pub struct RouteParser {
 }
 
 impl RouteParser {
-    const MAX_WAYPOINT_HOP_NM: f64 = 800.0;
+    const MAX_WAYPOINT_HOP_NM: f64 = 1200.0;
+    const MAX_FIRST_FIX_FROM_DEP_NM: f64 = 400.0;
 
     pub fn new(db_pool: Arc<DatabasePool>) -> Self {
         Self { db_pool }
@@ -274,15 +275,6 @@ impl RouteParser {
                 continue;
             }
 
-            // 对于机场后紧随的首个疑似航点，如果候选都过远，给出更明确warning
-            if parsed.departure.is_some()
-                && last_waypoint.is_none()
-                && !self.is_airport_code(&token_upper)
-                && !AIRWAY_PATTERN.is_match(&token_upper)
-            {
-                parsed.warnings.push(format!("航点 {} 距离起飞机场过远，已忽略", token_upper));
-            }
-
             // 最后尝试作为目的机场
             if self.is_airport_code(&token_upper) && (expecting_destination || i == tokens.len() - 1) {
                 match self.db_pool.load_airport(&token_upper) {
@@ -368,7 +360,7 @@ impl RouteParser {
             return candidates.into_iter().next();
         }
 
-        let mut best: Option<(f64, Waypoint)> = None;
+        let mut best: Option<(f64, f64, Waypoint)> = None;
         let anchor_coord = prev_waypoint
             .map(|wp| wp.coordinate)
             .or_else(|| departure_airport.map(|ap| ap.coordinate));
@@ -378,9 +370,11 @@ impl RouteParser {
 
         for candidate in candidates {
             let mut score = 0.0;
+            let mut dist_to_anchor = f64::MAX;
 
             if let Some(anchor) = anchor_coord {
                 let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
+                dist_to_anchor = dist;
                 score += dist.min(6000.0);
                 if let Some(region) = anchor_region {
                     if !candidate.icao_code.is_empty() && candidate.icao_code == region {
@@ -416,25 +410,28 @@ impl RouteParser {
             }
 
             match &mut best {
-                Some((best_score, best_wp)) if score < *best_score => {
+                Some((best_score, best_dist, best_wp)) if score < *best_score
+                    || ((score - *best_score).abs() < 1e-6 && dist_to_anchor < *best_dist) =>
+                {
                     *best_score = score;
+                    *best_dist = dist_to_anchor;
                     *best_wp = candidate;
                 }
-                None => best = Some((score, candidate)),
+                None => best = Some((score, dist_to_anchor, candidate)),
                 _ => {}
             }
         }
 
-        let selected = best.map(|(_, wp)| wp)?;
+        let (.., selected) = best?;
 
-        // 最终兜底：若相对锚点过远且区域不一致，放弃解析（上层会给warning/unknown）
-        if let Some(anchor) = anchor_coord {
-            let dist = haversine_distance_nm(&anchor, &selected.coordinate);
-            if dist > Self::MAX_WAYPOINT_HOP_NM {
-                let same_region = anchor_region
+        // 起点后的第一个航点：仅在离场机场附近时接受，避免把首点误吸附到遥远同名点
+        if prev_waypoint.is_none() {
+            if let Some(dep) = departure_airport {
+                let dist = haversine_distance_nm(&dep.coordinate, &selected.coordinate);
+                let same_region = departure_region
                     .map(|r| !selected.icao_code.is_empty() && selected.icao_code == r)
                     .unwrap_or(false);
-                if !same_region {
+                if dist > Self::MAX_FIRST_FIX_FROM_DEP_NM && !same_region {
                     return None;
                 }
             }
