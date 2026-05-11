@@ -30,6 +30,9 @@ pub struct RouteParser {
 }
 
 impl RouteParser {
+    const MAX_WAYPOINT_HOP_NM: f64 = 1200.0;
+    const MAX_FIRST_FIX_FROM_DEP_NM: f64 = 400.0;
+
     pub fn new(db_pool: Arc<DatabasePool>) -> Self {
         Self { db_pool }
     }
@@ -131,8 +134,8 @@ impl RouteParser {
                 continue;
             }
 
-            // 处理SID
-            if token_upper.contains("SID") || (parsed.departure.is_some() && parsed.sid.is_none()) {
+            // 处理SID（仅当明确包含SID关键字时）
+            if token_upper.contains("SID") {
                 if let Some(sid_name) = self.extract_procedure_name(&token_upper, "SID") {
                     parsed.sid = Some(sid_name.clone());
                     parsed.elements.push(RouteElement::SID(sid_name));
@@ -161,6 +164,7 @@ impl RouteParser {
                         if let Some(to_wp) = self.pick_waypoint_candidate(
                             &tokens[i],
                             &last_waypoint,
+                            parsed.departure.as_ref(),
                             departure_region.as_deref(),
                             destination_region.as_deref(),
                         )? {
@@ -205,6 +209,7 @@ impl RouteParser {
                             .and_then(|id| self.pick_waypoint_candidate(
                                 id,
                                 &last_waypoint,
+                                parsed.departure.as_ref(),
                                 departure_region.as_deref(),
                                 destination_region.as_deref(),
                             ).ok())
@@ -260,6 +265,7 @@ impl RouteParser {
             if let Some(waypoint) = self.pick_waypoint_candidate(
                 &token_upper,
                 &last_waypoint,
+                parsed.departure.as_ref(),
                 departure_region.as_deref(),
                 destination_region.as_deref(),
             )? {
@@ -317,6 +323,7 @@ impl RouteParser {
         &self,
         identifier: &str,
         prev_waypoint: &Option<Waypoint>,
+        departure_airport: Option<&Airport>,
         departure_region: Option<&str>,
         destination_region: Option<&str>,
     ) -> Result<Option<Waypoint>> {
@@ -324,6 +331,7 @@ impl RouteParser {
         Ok(self.select_best_waypoint(
             candidates,
             prev_waypoint.as_ref(),
+            departure_airport,
             departure_region,
             destination_region,
         ))
@@ -341,6 +349,7 @@ impl RouteParser {
         &self,
         candidates: Vec<Waypoint>,
         prev_waypoint: Option<&Waypoint>,
+        departure_airport: Option<&Airport>,
         departure_region: Option<&str>,
         destination_region: Option<&str>,
     ) -> Option<Waypoint> {
@@ -351,15 +360,36 @@ impl RouteParser {
             return candidates.into_iter().next();
         }
 
-        let mut best: Option<(f64, Waypoint)> = None;
+        let mut best: Option<(f64, f64, Waypoint)> = None;
+        let anchor_coord = prev_waypoint
+            .map(|wp| wp.coordinate)
+            .or_else(|| departure_airport.map(|ap| ap.coordinate));
+        let anchor_region = prev_waypoint
+            .map(|wp| wp.icao_code.as_str())
+            .or(departure_region);
+
         for candidate in candidates {
             let mut score = 0.0;
+            let mut dist_to_anchor = f64::MAX;
 
-            if let Some(prev) = prev_waypoint {
-                let dist = haversine_distance_nm(&prev.coordinate, &candidate.coordinate);
+            if let Some(anchor) = anchor_coord {
+                let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
+                dist_to_anchor = dist;
                 score += dist.min(6000.0);
-                if !prev.icao_code.is_empty() && prev.icao_code == candidate.icao_code {
-                    score -= 250.0;
+                if let Some(region) = anchor_region {
+                    if !candidate.icao_code.is_empty() && candidate.icao_code == region {
+                        score -= 300.0;
+                    }
+                }
+
+                // 距离过远且区域不一致时强惩罚，避免跳到同名异地台站
+                if dist > Self::MAX_WAYPOINT_HOP_NM {
+                    let same_region = anchor_region
+                        .map(|r| !candidate.icao_code.is_empty() && candidate.icao_code == r)
+                        .unwrap_or(false);
+                    if !same_region {
+                        score += 20000.0;
+                    }
                 }
             }
 
@@ -371,7 +401,7 @@ impl RouteParser {
 
             if let Some(dep_region) = departure_region {
                 if !candidate.icao_code.is_empty() && candidate.icao_code == dep_region {
-                    score -= 120.0;
+                    score -= 160.0;
                 }
             }
 
@@ -380,16 +410,34 @@ impl RouteParser {
             }
 
             match &mut best {
-                Some((best_score, best_wp)) if score < *best_score => {
+                Some((best_score, best_dist, best_wp)) if score < *best_score
+                    || ((score - *best_score).abs() < 1e-6 && dist_to_anchor < *best_dist) =>
+                {
                     *best_score = score;
+                    *best_dist = dist_to_anchor;
                     *best_wp = candidate;
                 }
-                None => best = Some((score, candidate)),
+                None => best = Some((score, dist_to_anchor, candidate)),
                 _ => {}
             }
         }
 
-        best.map(|(_, wp)| wp)
+        let (.., selected) = best?;
+
+        // 起点后的第一个航点：仅在离场机场附近时接受，避免把首点误吸附到遥远同名点
+        if prev_waypoint.is_none() {
+            if let Some(dep) = departure_airport {
+                let dist = haversine_distance_nm(&dep.coordinate, &selected.coordinate);
+                let same_region = departure_region
+                    .map(|r| !selected.icao_code.is_empty() && selected.icao_code == r)
+                    .unwrap_or(false);
+                if dist > Self::MAX_FIRST_FIX_FROM_DEP_NM && !same_region {
+                    return None;
+                }
+            }
+        }
+
+        Some(selected)
     }
 
     /// 提取程序名称
