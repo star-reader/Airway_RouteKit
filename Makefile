@@ -69,6 +69,15 @@ ffi:
 	@echo "  macOS:   target/release/libroutekit.dylib"
 	@echo "  Windows: target/release/routekit.dll"
 
+libs: build build-linux
+	@echo "copying shared libraries to libs/..."
+	mkdir -p libs/linux libs/macos
+	cp target/x86_64-unknown-linux-gnu/release/libroutekit.so libs/linux/libroutekit.so
+	cp target/release/libroutekit.dylib libs/macos/libroutekit.dylib
+	@echo "done:"
+	@file libs/linux/libroutekit.so
+	@file libs/macos/libroutekit.dylib
+
 header:
 	@echo "header file located at: routekit.h"
 
