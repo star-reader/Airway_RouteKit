@@ -10,7 +10,7 @@ fn main() -> Result<()> {
 
     // 1. 创建RouteKit实例
     println!("1. 初始化RouteKit...");
-    let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db")?;
+    let kit = RouteKit::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db")?;
     println!("   ✓ RouteKit初始化成功\n");
 
     // 2. 加载机场信息
