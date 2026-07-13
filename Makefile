@@ -1,4 +1,4 @@
-.PHONY: all build test clean doc examples bench fmt clippy install
+.PHONY: all build test clean doc examples bench fmt clippy install build-linux build-linux-amd64 build-linux-arm64 libs libs-linux
 
 all: build
 
@@ -10,11 +10,19 @@ release:
 	@echo "building RouteKit release..."
 	cargo build --release
 
-build-linux:
-	@echo "building RouteKit release for linux"
-	export LIBSQLITE3_SYS_USE_BUNDLED=1 && \
-	export LIBSQLITE3_SYS_USE_PKG_CONFIG=0 && \
-	cargo zigbuild --release --target x86_64-unknown-linux-gnu
+LINUX_TARGET_AMD64 := x86_64-unknown-linux-gnu
+LINUX_TARGET_ARM64 := aarch64-unknown-linux-gnu
+LINUX_BUILD_ENV = LIBSQLITE3_SYS_USE_BUNDLED=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=0
+
+build-linux: build-linux-amd64
+
+build-linux-amd64:
+	@echo "building RouteKit release for linux amd64 ($(LINUX_TARGET_AMD64))"
+	$(LINUX_BUILD_ENV) cargo zigbuild --release --target $(LINUX_TARGET_AMD64)
+
+build-linux-arm64:
+	@echo "building RouteKit release for linux arm64 ($(LINUX_TARGET_ARM64))"
+	$(LINUX_BUILD_ENV) cargo zigbuild --release --target $(LINUX_TARGET_ARM64)
 
 test:
 	@echo "running tests..."
@@ -69,13 +77,17 @@ ffi:
 	@echo "  macOS:   target/release/libroutekit.dylib"
 	@echo "  Windows: target/release/routekit.dll"
 
-libs: build build-linux
+libs: build libs-linux
+
+libs-linux: build-linux-amd64 build-linux-arm64
 	@echo "copying shared libraries to libs/..."
-	mkdir -p libs/linux libs/macos
-	cp target/x86_64-unknown-linux-gnu/release/libroutekit.so libs/linux/libroutekit.so
+	mkdir -p libs/linux/amd64 libs/linux/arm64 libs/macos
+	cp target/$(LINUX_TARGET_AMD64)/release/libroutekit.so libs/linux/amd64/libroutekit.so
+	cp target/$(LINUX_TARGET_ARM64)/release/libroutekit.so libs/linux/arm64/libroutekit.so
 	cp target/release/libroutekit.dylib libs/macos/libroutekit.dylib
 	@echo "done:"
-	@file libs/linux/libroutekit.so
+	@file libs/linux/amd64/libroutekit.so
+	@file libs/linux/arm64/libroutekit.so
 	@file libs/macos/libroutekit.dylib
 
 header:
@@ -87,6 +99,10 @@ help:
 	@echo "Available targets:"
 	@echo "  make build           - Build project (debug version)"
 	@echo "  make release         - Build release version"
+	@echo "  make build-linux     - Build Linux release (amd64, alias)"
+	@echo "  make build-linux-amd64 - Build Linux release for x86_64"
+	@echo "  make build-linux-arm64 - Build Linux release for aarch64"
+	@echo "  make libs            - Build and copy macOS/Linux shared libraries"
 	@echo "  make test            - Run all tests"
 	@echo "  make test-verbose    - Run tests (verbose output)"
 	@echo "  make test-integration- Run integration tests"
