@@ -751,8 +751,8 @@ mod tests {
 
     #[test]
     fn test_database_pool_creation() {
-        if std::path::Path::new("raw_data/e_dfd_PMDG.s3db").exists() {
-            let pool = DatabasePool::new("raw_data/e_dfd_PMDG.s3db", 5);
+        if std::path::Path::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db").exists() {
+            let pool = DatabasePool::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db", 5);
             assert!(pool.is_ok());
         }
     }

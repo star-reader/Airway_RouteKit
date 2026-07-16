@@ -145,6 +145,8 @@ fn setup_parser_db() -> NamedTempFile {
     insert_vor(&conn, "AND", "ZS", "AND VOR", 30.25666667, 121.22166667);
     insert_wp(&conn, "CHI", "ZY", 39.20, 122.90, "Enroute");
     insert_wp(&conn, "CHI", "YB", -12.55, 130.86666667, "Enroute");
+    insert_wp(&conn, "NEAR1", "ZS", 35.15, 120.69, "Enroute");
+    insert_wp(&conn, "FARPT", "ES", 54.92, 15.66, "Enroute");
 
     // B221：故意放入两个 AND（不同坐标）验证航路内部歧义选择
     insert_airway_seg(&conn, "B221", 10, "SUPAR", 30.80, 121.00, "ZS");
@@ -158,8 +160,8 @@ fn setup_parser_db() -> NamedTempFile {
     insert_airway_seg(&conn, "W90", 30, "SUPAR", 30.80, 121.00, "ZS");
 
     // 仅存在于NDB表，不存在于waypoints表，用于验证回退读取
-    insert_enroute_ndb(&conn, "NDBA", "ZS", "NDB A", 31.00, 121.30);
-    insert_terminal_ndb(&conn, "NDBT", "ZS", "NDB T", 31.10, 121.40);
+    insert_enroute_ndb(&conn, "NDBA", "ZG", "NDB A", 23.50, 113.50);
+    insert_terminal_ndb(&conn, "NDBT", "ZG", "NDB T", 23.60, 113.60);
 
     tmp
 }
@@ -373,4 +375,26 @@ fn test_duplicate_identifier_prefers_local_continuity_over_far_region() {
     let chi = chi_wp.expect("CHI should be parsed");
     assert_eq!(chi.icao_code, "ZY");
     assert!(chi.coordinate.latitude > 0.0, "should not jump to YB/Channel Island candidate");
+}
+
+#[test]
+fn test_single_far_candidate_is_skipped_instead_of_forced_match() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit
+        .parse_route("ZYHB NEAR1 FARPT ZSPD")
+        .expect("parse");
+
+    let has_farpt = parsed.elements.iter().any(|e| match e {
+        RouteElement::Waypoint(wp) => wp.identifier == "FARPT",
+        _ => false,
+    });
+    assert!(!has_farpt, "FARPT should be skipped when only far candidate exists");
+
+    let has_unknown_farpt = parsed.elements.iter().any(|e| match e {
+        RouteElement::Unknown(id) => id == "FARPT",
+        _ => false,
+    });
+    assert!(has_unknown_farpt, "FARPT should remain as unknown token");
 }

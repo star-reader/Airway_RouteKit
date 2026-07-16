@@ -45,6 +45,16 @@ pub fn haversine_distance_km(coord1: &Coordinate, coord2: &Coordinate) -> f64 {
     EARTH_RADIUS_KM * c
 }
 
+/// 计算两个航向之间的转弯角度（度，0-180）
+pub fn bearing_turn_angle(bearing1: f64, bearing2: f64) -> f64 {
+    let diff = (bearing2 - bearing1).abs();
+    if diff > 180.0 {
+        360.0 - diff
+    } else {
+        diff
+    }
+}
+
 /// 计算从coord1到coord2的初始航向（度，0-360）
 /// 返回真航向
 pub fn calculate_bearing(coord1: &Coordinate, coord2: &Coordinate) -> f64 {
@@ -169,6 +179,13 @@ mod tests {
         
         let bearing = calculate_bearing(&coord1, &coord2);
         assert!(bearing >= 0.0 && bearing < 360.0);
+    }
+
+    #[test]
+    fn test_bearing_turn_angle() {
+        assert!((bearing_turn_angle(10.0, 350.0) - 20.0).abs() < 1e-6);
+        assert!((bearing_turn_angle(90.0, 270.0) - 180.0).abs() < 1e-6);
+        assert!((bearing_turn_angle(45.0, 60.0) - 15.0).abs() < 1e-6);
     }
 
     #[test]

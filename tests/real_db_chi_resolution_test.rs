@@ -43,3 +43,44 @@ fn test_real_db_long_route_no_unknown_for_valid_vor_tokens() {
         warnings
     );
 }
+
+#[test]
+fn test_real_db_rejects_far_gorpi_and_tosas_on_shanghai_route() {
+    if !std::path::Path::new(TEST_DB_PATH).exists() {
+        return;
+    }
+
+    let kit = RouteKit::new(TEST_DB_PATH).expect("init routekit");
+    let route = "ZYHB BUBDI HRB PABKI PAGDO ISBOP NULRA LJB LEMOT NUBKI BIDIB ISKEM TOSID NODAL CHI VENOS UDETI DOBGA ORIXA TEKAM FD XIVID TAO XDX AVLOK IDVEL VEVED GORPI ODULO UDOXI HSH TOSAS PK JTN ZSSS";
+    let parsed = kit.parse_route(route).expect("parse route");
+
+    let gorpi = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Waypoint(wp) if wp.identifier == "GORPI" => Some(wp.clone()),
+        _ => None,
+    });
+    assert!(
+        gorpi.is_none(),
+        "GORPI should be skipped when only distant European candidate exists, got {:?}",
+        gorpi
+    );
+
+    let tosas = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Waypoint(wp) if wp.identifier == "TOSAS" => Some(wp.clone()),
+        _ => None,
+    });
+    assert!(
+        tosas.is_none(),
+        "TOSAS should be skipped when only distant equatorial candidate exists, got {:?}",
+        tosas
+    );
+
+    let pk = parsed
+        .elements
+        .iter()
+        .find_map(|e| match e {
+            RouteElement::Waypoint(wp) if wp.identifier == "PK" => Some(wp.clone()),
+            _ => None,
+        })
+        .expect("PK should still resolve near Shanghai");
+    assert_eq!(pk.icao_code, "ZS", "PK should resolve to local ZS candidate");
+}

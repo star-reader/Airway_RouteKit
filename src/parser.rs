@@ -1,6 +1,6 @@
 use crate::database::DatabasePool;
 use crate::error::Result;
-use crate::geo::haversine_distance_nm;
+use crate::geo::{bearing_turn_angle, calculate_bearing, haversine_distance_nm};
 use crate::models::*;
 use crate::utils::*;
 use lazy_static::lazy_static;
@@ -30,8 +30,16 @@ pub struct RouteParser {
 }
 
 impl RouteParser {
-    const MAX_WAYPOINT_HOP_NM: f64 = 1200.0;
+    /// 相邻航点间允许的最大跳变距离（海里）
+    const MAX_WAYPOINT_HOP_NM: f64 = 500.0;
+    /// 起点后第一个航点允许的最大距离
     const MAX_FIRST_FIX_FROM_DEP_NM: f64 = 400.0;
+    /// 拒绝引入过大转弯的角度阈值（度）
+    const MAX_TURN_ANGLE_DEG: f64 = 135.0;
+    /// 候选点相对“朝目的地”方向的最大偏离角（度）
+    const MAX_OFF_DESTINATION_BEARING_DEG: f64 = 110.0;
+    /// 在较大距离下才启用目的地方向校验的距离阈值（海里）
+    const OFF_DESTINATION_CHECK_MIN_NM: f64 = 150.0;
 
     pub fn new(db_pool: Arc<DatabasePool>) -> Self {
         Self { db_pool }
@@ -61,7 +69,21 @@ impl RouteParser {
         }
 
         // 解析各个部分
-        self.parse_tokens(&tokens, &mut parsed)?;
+        let destination_hint = tokens
+            .iter()
+            .rev()
+            .find(|token| self.is_airport_code(&token.to_uppercase()))
+            .and_then(|icao| self.db_pool.load_airport(&icao.to_uppercase()).ok());
+        let destination_region_hint = destination_hint
+            .as_ref()
+            .and_then(|ap| Self::airport_region_code(&ap.identifier));
+
+        self.parse_tokens(
+            &tokens,
+            &mut parsed,
+            destination_hint.as_ref(),
+            destination_region_hint.as_deref(),
+        )?;
 
         // 验证解析结果
         parsed.is_valid = parsed.errors.is_empty() 
@@ -91,12 +113,20 @@ impl RouteParser {
     }
 
     /// 解析令牌序列
-    fn parse_tokens(&self, tokens: &[String], parsed: &mut ParsedRoute) -> Result<()> {
+    fn parse_tokens(
+        &self,
+        tokens: &[String],
+        parsed: &mut ParsedRoute,
+        destination_hint: Option<&Airport>,
+        destination_region_hint: Option<&str>,
+    ) -> Result<()> {
         let mut i = 0;
+        let mut second_last_waypoint: Option<Waypoint> = None;
         let mut last_waypoint: Option<Waypoint> = None;
         let mut expecting_destination = false;
         let mut departure_region: Option<String> = None;
-        let mut destination_region: Option<String> = None;
+        let mut destination_region: Option<String> =
+            destination_region_hint.map(|region| region.to_string());
 
         while i < tokens.len() {
             let token = &tokens[i];
@@ -164,7 +194,9 @@ impl RouteParser {
                         if let Some(to_wp) = self.pick_waypoint_candidate(
                             &tokens[i],
                             &last_waypoint,
+                            &second_last_waypoint,
                             parsed.departure.as_ref(),
+                            destination_hint,
                             departure_region.as_deref(),
                             destination_region.as_deref(),
                         )? {
@@ -172,6 +204,7 @@ impl RouteParser {
                                 from: from_wp.clone(),
                                 to: to_wp.clone(),
                             });
+                            second_last_waypoint = last_waypoint;
                             last_waypoint = Some(to_wp);
                         }
                     }
@@ -206,13 +239,18 @@ impl RouteParser {
                     if !all_segments.is_empty() {
                         let to_waypoint_hint = to_waypoint_id
                             .as_deref()
-                            .and_then(|id| self.pick_waypoint_candidate(
-                                id,
-                                &last_waypoint,
-                                parsed.departure.as_ref(),
-                                departure_region.as_deref(),
-                                destination_region.as_deref(),
-                            ).ok())
+                            .and_then(|id| {
+                                self.pick_waypoint_candidate(
+                                    id,
+                                    &last_waypoint,
+                                    &second_last_waypoint,
+                                    parsed.departure.as_ref(),
+                                    destination_hint,
+                                    departure_region.as_deref(),
+                                    destination_region.as_deref(),
+                                )
+                                .ok()
+                            })
                             .flatten();
 
                         // 截取从 from_waypoint 到 to_waypoint 之间的航段
@@ -231,6 +269,7 @@ impl RouteParser {
                                 segments: filtered_segments.clone(),
                             });
                             if let Some(last_seg) = filtered_segments.last() {
+                                second_last_waypoint = last_waypoint;
                                 last_waypoint = Some(last_seg.waypoint.clone());
                             }
                             if let (Some(to_id), Some(last_seg)) =
@@ -265,11 +304,14 @@ impl RouteParser {
             if let Some(waypoint) = self.pick_waypoint_candidate(
                 &token_upper,
                 &last_waypoint,
+                &second_last_waypoint,
                 parsed.departure.as_ref(),
+                destination_hint,
                 departure_region.as_deref(),
                 destination_region.as_deref(),
             )? {
                 parsed.elements.push(RouteElement::Waypoint(waypoint.clone()));
+                second_last_waypoint = last_waypoint;
                 last_waypoint = Some(waypoint);
                 i += 1;
                 continue;
@@ -323,7 +365,9 @@ impl RouteParser {
         &self,
         identifier: &str,
         prev_waypoint: &Option<Waypoint>,
+        second_last_waypoint: &Option<Waypoint>,
         departure_airport: Option<&Airport>,
+        destination_hint: Option<&Airport>,
         departure_region: Option<&str>,
         destination_region: Option<&str>,
     ) -> Result<Option<Waypoint>> {
@@ -331,7 +375,9 @@ impl RouteParser {
         Ok(self.select_best_waypoint(
             candidates,
             prev_waypoint.as_ref(),
+            second_last_waypoint.as_ref(),
             departure_airport,
+            destination_hint,
             departure_region,
             destination_region,
         ))
@@ -349,24 +395,24 @@ impl RouteParser {
         &self,
         candidates: Vec<Waypoint>,
         prev_waypoint: Option<&Waypoint>,
+        second_last_waypoint: Option<&Waypoint>,
         departure_airport: Option<&Airport>,
+        destination_hint: Option<&Airport>,
         departure_region: Option<&str>,
         destination_region: Option<&str>,
     ) -> Option<Waypoint> {
         if candidates.is_empty() {
             return None;
         }
-        if candidates.len() == 1 {
-            return candidates.into_iter().next();
-        }
 
-        let mut best: Option<(f64, f64, Waypoint)> = None;
         let anchor_coord = prev_waypoint
             .map(|wp| wp.coordinate)
             .or_else(|| departure_airport.map(|ap| ap.coordinate));
         let anchor_region = prev_waypoint
             .map(|wp| wp.icao_code.as_str())
             .or(departure_region);
+
+        let mut best: Option<(f64, f64, Waypoint)> = None;
 
         for candidate in candidates {
             let mut score = 0.0;
@@ -376,13 +422,13 @@ impl RouteParser {
                 let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
                 dist_to_anchor = dist;
                 score += dist.min(6000.0);
+
                 if let Some(region) = anchor_region {
                     if !candidate.icao_code.is_empty() && candidate.icao_code == region {
                         score -= 300.0;
                     }
                 }
 
-                // 距离过远且区域不一致时强惩罚，避免跳到同名异地台站
                 if dist > Self::MAX_WAYPOINT_HOP_NM {
                     let same_region = anchor_region
                         .map(|r| !candidate.icao_code.is_empty() && candidate.icao_code == r)
@@ -424,20 +470,80 @@ impl RouteParser {
 
         let (.., selected) = best?;
 
-        // 起点后的第一个航点：仅在离场机场附近时接受，避免把首点误吸附到遥远同名点
+        if !self.is_waypoint_acceptable(
+            &selected,
+            prev_waypoint,
+            second_last_waypoint,
+            departure_airport,
+            destination_hint,
+            departure_region,
+        ) {
+            return None;
+        }
+
+        Some(selected)
+    }
+
+    fn is_waypoint_acceptable(
+        &self,
+        candidate: &Waypoint,
+        prev_waypoint: Option<&Waypoint>,
+        second_last_waypoint: Option<&Waypoint>,
+        departure_airport: Option<&Airport>,
+        destination_hint: Option<&Airport>,
+        departure_region: Option<&str>,
+    ) -> bool {
+        let anchor_coord = prev_waypoint
+            .map(|wp| wp.coordinate)
+            .or_else(|| departure_airport.map(|ap| ap.coordinate));
+        let anchor_region = prev_waypoint
+            .map(|wp| wp.icao_code.as_str())
+            .or(departure_region);
+
+        let Some(anchor) = anchor_coord else {
+            return true;
+        };
+
+        let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
+        let same_region = anchor_region
+            .map(|r| !candidate.icao_code.is_empty() && candidate.icao_code == r)
+            .unwrap_or(false);
+
         if prev_waypoint.is_none() {
-            if let Some(dep) = departure_airport {
-                let dist = haversine_distance_nm(&dep.coordinate, &selected.coordinate);
-                let same_region = departure_region
-                    .map(|r| !selected.icao_code.is_empty() && selected.icao_code == r)
-                    .unwrap_or(false);
+            if let Some(_dep) = departure_airport {
                 if dist > Self::MAX_FIRST_FIX_FROM_DEP_NM && !same_region {
-                    return None;
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if dist > Self::MAX_WAYPOINT_HOP_NM && !same_region {
+            return false;
+        }
+
+        if let (Some(prev), Some(second_last)) = (prev_waypoint, second_last_waypoint) {
+            let inbound = calculate_bearing(&second_last.coordinate, &prev.coordinate);
+            let outbound = calculate_bearing(&prev.coordinate, &candidate.coordinate);
+            let turn = bearing_turn_angle(inbound, outbound);
+            if turn > Self::MAX_TURN_ANGLE_DEG && dist > Self::OFF_DESTINATION_CHECK_MIN_NM {
+                return false;
+            }
+        }
+
+        if let (Some(prev), Some(dest)) = (prev_waypoint, destination_hint) {
+            if dist > Self::OFF_DESTINATION_CHECK_MIN_NM {
+                let toward_dest = calculate_bearing(&prev.coordinate, &dest.coordinate);
+                let toward_candidate =
+                    calculate_bearing(&prev.coordinate, &candidate.coordinate);
+                let off_course = bearing_turn_angle(toward_dest, toward_candidate);
+                if off_course > Self::MAX_OFF_DESTINATION_BEARING_DEG && !same_region {
+                    return false;
                 }
             }
         }
 
-        Some(selected)
+        true
     }
 
     /// 提取程序名称
@@ -543,16 +649,24 @@ impl RouteParser {
             return matches.pop();
         }
 
-        let mut best: Option<(f64, usize)> = None;
+        let mut best: Option<(f64, f64, usize)> = None;
         for idx in matches {
             let seg_wp = &segments[idx].waypoint;
             let mut score = 0.0;
+            let mut dist_to_hint = f64::MAX;
 
             if let Some(hint) = waypoint_hint {
                 let dist = haversine_distance_nm(&hint.coordinate, &seg_wp.coordinate);
+                dist_to_hint = dist;
                 score += dist.min(6000.0);
                 if !hint.icao_code.is_empty() && hint.icao_code == seg_wp.icao_code {
                     score -= 250.0;
+                }
+
+                let same_region =
+                    !hint.icao_code.is_empty() && hint.icao_code == seg_wp.icao_code;
+                if dist > Self::MAX_WAYPOINT_HOP_NM && !same_region {
+                    continue;
                 }
             }
 
@@ -569,12 +683,13 @@ impl RouteParser {
             }
 
             match best {
-                Some((best_score, _)) if score >= best_score => {}
-                _ => best = Some((score, idx)),
+                Some((best_score, best_dist, _)) if score > best_score
+                    || ((score - best_score).abs() < 1e-6 && dist_to_hint >= best_dist) => {}
+                _ => best = Some((score, dist_to_hint, idx)),
             }
         }
 
-        best.map(|(_, idx)| idx)
+        best.map(|(_, _, idx)| idx)
     }
 
     /// 解析自由格式的航路字符串（高容错性）
