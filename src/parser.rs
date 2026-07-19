@@ -32,6 +32,8 @@ pub struct RouteParser {
 impl RouteParser {
     /// 相邻航点间允许的最大跳变距离（海里）
     const MAX_WAYPOINT_HOP_NM: f64 = 500.0;
+    /// 直飞（DCT）航段允许的最大跳变距离（海里），用于跨洋长直飞
+    const MAX_DCT_HOP_NM: f64 = 2500.0;
     /// 起点后第一个航点允许的最大距离
     const MAX_FIRST_FIX_FROM_DEP_NM: f64 = 400.0;
     /// 拒绝引入过大转弯的角度阈值（度）
@@ -40,6 +42,10 @@ impl RouteParser {
     const MAX_OFF_DESTINATION_BEARING_DEG: f64 = 110.0;
     /// 在较大距离下才启用目的地方向校验的距离阈值（海里）
     const OFF_DESTINATION_CHECK_MIN_NM: f64 = 150.0;
+    /// 允许长直飞时，相邻航段转弯角上限（度）
+    const GOOD_CONTINUITY_TURN_DEG: f64 = 45.0;
+    /// 允许长直飞时，相对目的地方向偏离角上限（度）
+    const GOOD_CONTINUITY_OFF_COURSE_DEG: f64 = 45.0;
 
     pub fn new(db_pool: Arc<DatabasePool>) -> Self {
         Self { db_pool }
@@ -300,7 +306,7 @@ impl RouteParser {
                 continue;
             }
 
-            // 处理航点
+            // 处理航点（相邻航点之间无航路时，等价于 DCT）
             if let Some(waypoint) = self.pick_waypoint_candidate(
                 &token_upper,
                 &last_waypoint,
@@ -310,7 +316,14 @@ impl RouteParser {
                 departure_region.as_deref(),
                 destination_region.as_deref(),
             )? {
-                parsed.elements.push(RouteElement::Waypoint(waypoint.clone()));
+                if let Some(from_wp) = last_waypoint.clone() {
+                    parsed.elements.push(RouteElement::Direct {
+                        from: from_wp,
+                        to: waypoint.clone(),
+                    });
+                } else {
+                    parsed.elements.push(RouteElement::Waypoint(waypoint.clone()));
+                }
                 second_last_waypoint = last_waypoint;
                 last_waypoint = Some(waypoint);
                 i += 1;
@@ -519,7 +532,16 @@ impl RouteParser {
         }
 
         if dist > Self::MAX_WAYPOINT_HOP_NM && !same_region {
-            return false;
+            if dist > Self::MAX_DCT_HOP_NM
+                || !self.has_good_dct_continuity(
+                    candidate,
+                    prev_waypoint,
+                    second_last_waypoint,
+                    destination_hint,
+                )
+            {
+                return false;
+            }
         }
 
         if let (Some(prev), Some(second_last)) = (prev_waypoint, second_last_waypoint) {
@@ -544,6 +566,40 @@ impl RouteParser {
         }
 
         true
+    }
+
+    /// 判断长直飞航段是否具备良好地理连续性（小转弯或朝向目的地）
+    fn has_good_dct_continuity(
+        &self,
+        candidate: &Waypoint,
+        prev_waypoint: Option<&Waypoint>,
+        second_last_waypoint: Option<&Waypoint>,
+        destination_hint: Option<&Airport>,
+    ) -> bool {
+        let Some(prev) = prev_waypoint else {
+            return true;
+        };
+
+        if let Some(second_last) = second_last_waypoint {
+            let inbound = calculate_bearing(&second_last.coordinate, &prev.coordinate);
+            let outbound = calculate_bearing(&prev.coordinate, &candidate.coordinate);
+            if bearing_turn_angle(inbound, outbound) <= Self::GOOD_CONTINUITY_TURN_DEG {
+                return true;
+            }
+        }
+
+        if let Some(dest) = destination_hint {
+            let toward_dest = calculate_bearing(&prev.coordinate, &dest.coordinate);
+            let toward_candidate =
+                calculate_bearing(&prev.coordinate, &candidate.coordinate);
+            if bearing_turn_angle(toward_dest, toward_candidate)
+                <= Self::GOOD_CONTINUITY_OFF_COURSE_DEG
+            {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// 提取程序名称

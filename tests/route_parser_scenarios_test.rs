@@ -230,6 +230,42 @@ fn get_first_airway_segments(parsed: &routekit::ParsedRoute, airway_id: &str) ->
         .unwrap_or_default()
 }
 
+fn find_resolved_waypoint(parsed: &routekit::ParsedRoute, identifier: &str) -> Option<routekit::Waypoint> {
+    for element in &parsed.elements {
+        match element {
+            RouteElement::Waypoint(wp) if wp.identifier == identifier => return Some(wp.clone()),
+            RouteElement::Direct { from, to } => {
+                if from.identifier == identifier {
+                    return Some(from.clone());
+                }
+                if to.identifier == identifier {
+                    return Some(to.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[test]
+fn test_consecutive_waypoints_emit_implicit_dct_segments() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR AND MULOV").expect("parse");
+
+    let direct_count = parsed
+        .elements
+        .iter()
+        .filter(|e| matches!(e, RouteElement::Direct { .. }))
+        .count();
+    assert_eq!(direct_count, 2, "two consecutive hops should emit two DCT segments");
+
+    let first_is_waypoint = matches!(parsed.elements.first(), Some(RouteElement::Waypoint(wp)) if wp.identifier == "SUPAR");
+    assert!(first_is_waypoint, "first fix should remain a Waypoint element");
+}
+
 #[test]
 fn test_dct_duplicate_waypoint_prefers_nearest_continuity() {
     let db = setup_parser_db();
@@ -310,13 +346,10 @@ fn test_ndb_tables_are_used_for_waypoint_resolution() {
     let kit = RouteKit::new(db.path()).expect("init routekit");
 
     let parsed = kit.parse_route("ZGGG SID NDBA NDBT ZSPD").expect("parse");
-    let ndb_waypoints: Vec<_> = parsed
-        .elements
+
+    let ndb_waypoints: Vec<_> = ["NDBA", "NDBT"]
         .iter()
-        .filter_map(|e| match e {
-            RouteElement::Waypoint(wp) if wp.identifier == "NDBA" || wp.identifier == "NDBT" => Some(wp.clone()),
-            _ => None,
-        })
+        .filter_map(|id| find_resolved_waypoint(&parsed, id))
         .collect();
 
     assert_eq!(ndb_waypoints.len(), 2);
@@ -367,12 +400,7 @@ fn test_duplicate_identifier_prefers_local_continuity_over_far_region() {
     let kit = RouteKit::new(db.path()).expect("init routekit");
 
     let parsed = kit.parse_route("ZYHB HRB NODAL CHI VENOS ZUCK").expect("parse");
-    let chi_wp = parsed.elements.iter().find_map(|e| match e {
-        RouteElement::Waypoint(wp) if wp.identifier == "CHI" => Some(wp.clone()),
-        _ => None,
-    });
-
-    let chi = chi_wp.expect("CHI should be parsed");
+    let chi = find_resolved_waypoint(&parsed, "CHI").expect("CHI should be parsed");
     assert_eq!(chi.icao_code, "ZY");
     assert!(chi.coordinate.latitude > 0.0, "should not jump to YB/Channel Island candidate");
 }
