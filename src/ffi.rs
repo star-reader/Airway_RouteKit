@@ -1,6 +1,6 @@
-/// FFI接口模块 - 供Go等外部语言调用
-/// 
-/// 提供C ABI兼容的接口
+//! FFI接口模块,供外部调用
+//!
+//! 提供C ABI兼容的接口
 
 use crate::error::Result;
 use crate::models::*;
@@ -11,12 +11,12 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 thread_local! {
-    static LAST_ERROR: RefCell<Option<String>> = RefCell::new(None);
+    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(err: String) {
     LAST_ERROR.with(|e| {
-        *e.borrow_mut() = Some(err);
+        *e.borrow_mut() = CString::new(err.replace('\0', " ")).ok();
     });
 }
 
@@ -42,22 +42,23 @@ unsafe fn c_str_to_string(c_str: *const c_char) -> Result<String> {
     if c_str.is_null() {
         return Err(crate::error::RouteKitError::General("空指针".to_string()));
     }
-    
+
     let c_str = CStr::from_ptr(c_str);
-    Ok(c_str.to_str()
+    Ok(c_str
+        .to_str()
         .map_err(|e| crate::error::RouteKitError::General(format!("UTF-8转换错误: {}", e)))?
         .to_string())
 }
 
 /// 创建RouteKit实例
-/// 
+///
 /// # Safety
-/// 
+///
 /// db_path 必须是有效的C字符串指针
 #[no_mangle]
 pub unsafe extern "C" fn routekit_new(db_path: *const c_char) -> *mut c_void {
     clear_last_error();
-    
+
     let db_path_str = match c_str_to_string(db_path) {
         Ok(s) => s,
         Err(e) => {
@@ -76,9 +77,9 @@ pub unsafe extern "C" fn routekit_new(db_path: *const c_char) -> *mut c_void {
 }
 
 /// 销毁RouteKit实例
-/// 
+///
 /// # Safety
-/// 
+///
 /// handle 必须是通过 routekit_new 创建的有效指针
 #[no_mangle]
 pub unsafe extern "C" fn routekit_free(handle: *mut c_void) {
@@ -87,15 +88,15 @@ pub unsafe extern "C" fn routekit_free(handle: *mut c_void) {
     }
 }
 
-/// 查找航路（简化版本，返回JSON字符串）
-/// 
+/// 查找航路
+///
 /// # Safety
-/// 
+///
 /// handle 必须是有效的RouteKit实例
 /// departure_icao 和 destination_icao 必须是有效的C字符串
-/// 
+///
 /// # Returns
-/// 
+///
 /// 返回JSON格式的航路信息，调用者负责释放返回的字符串
 #[no_mangle]
 pub unsafe extern "C" fn routekit_find_routes(
@@ -105,7 +106,7 @@ pub unsafe extern "C" fn routekit_find_routes(
     max_routes: usize,
 ) -> *mut c_char {
     clear_last_error();
-    
+
     if handle.is_null() {
         set_last_error("Invalid handle: null pointer".to_string());
         return ptr::null_mut();
@@ -158,15 +159,85 @@ pub unsafe extern "C" fn routekit_find_routes(
     }
 }
 
-/// 解析航路字符串
-/// 
+/// Search with optional supplemental paths, returning detailed routes and diagnostics.
+///
 /// # Safety
-/// 
+/// handle must be a live RouteKit handle; JSON arguments must be valid C strings.
+/// Release the returned string with routekit_free_string.
+#[no_mangle]
+pub unsafe extern "C" fn routekit_find_routes_with_options(
+    handle: *mut c_void,
+    request_json: *const c_char,
+    options_json: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+    if handle.is_null() {
+        set_last_error("Invalid handle: null pointer".into());
+        return ptr::null_mut();
+    }
+    let result = (|| -> Result<String> {
+        let request: RouteRequest = serde_json::from_str(&c_str_to_string(request_json)?)?;
+        let options: crate::SearchOptions = serde_json::from_str(&c_str_to_string(options_json)?)?;
+        let kit = &*(handle as *const RouteKit);
+        Ok(serde_json::to_string(
+            &kit.find_routes_with_options(&request, &options)?,
+        )?)
+    })();
+    match result
+        .and_then(|s| CString::new(s).map_err(|e| crate::RouteKitError::General(e.to_string())))
+    {
+        Ok(s) => s.into_raw(),
+        Err(e) => {
+            set_last_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// 使用区域规则与质量策略搜索航路，返回附加质量诊断。
+///
+/// # Safety
+/// The handle and JSON pointers must be valid for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn routekit_find_routes_with_context(
+    handle: *mut c_void,
+    request_json: *const c_char,
+    context_json: *const c_char,
+) -> *mut c_char {
+    clear_last_error();
+    if handle.is_null() {
+        set_last_error("Invalid handle: null pointer".into());
+        return ptr::null_mut();
+    }
+    let result = (|| -> Result<String> {
+        let request: RouteRequest = serde_json::from_str(&c_str_to_string(request_json)?)?;
+        let context: crate::PlanningContext =
+            serde_json::from_str(&c_str_to_string(context_json)?)?;
+        let kit = &*(handle as *const RouteKit);
+        Ok(serde_json::to_string(
+            &kit.find_routes_with_context(&request, &context)?,
+        )?)
+    })();
+    match result
+        .and_then(|s| CString::new(s).map_err(|e| crate::RouteKitError::General(e.to_string())))
+    {
+        Ok(s) => s.into_raw(),
+        Err(e) => {
+            set_last_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// 解析航路字符串
+///
+/// # Safety
+///
 /// handle 必须是有效的RouteKit实例
 /// route_string 必须是有效的C字符串
-/// 
+///
 /// # Returns
-/// 
+///
 /// 返回JSON格式的解析结果，调用者负责释放返回的字符串
 #[no_mangle]
 pub unsafe extern "C" fn routekit_parse_route(
@@ -174,7 +245,7 @@ pub unsafe extern "C" fn routekit_parse_route(
     route_string: *const c_char,
 ) -> *mut c_char {
     clear_last_error();
-    
+
     if handle.is_null() {
         set_last_error("Invalid handle: null pointer".to_string());
         return ptr::null_mut();
@@ -212,9 +283,9 @@ pub unsafe extern "C" fn routekit_parse_route(
 }
 
 /// 释放FFI返回的字符串
-/// 
+///
 /// # Safety
-/// 
+///
 /// s 必须是通过FFI函数返回的有效字符串指针
 #[no_mangle]
 pub unsafe extern "C" fn routekit_free_string(s: *mut c_char) {
@@ -224,31 +295,23 @@ pub unsafe extern "C" fn routekit_free_string(s: *mut c_char) {
 }
 
 /// 获取最后一次错误信息
-/// 
+///
 /// # Safety
-/// 
+///
 /// 返回的字符串指针在下次调用任何FFI函数前有效
 /// 调用者应该立即复制字符串内容，不需要手动释放
 #[no_mangle]
 pub unsafe extern "C" fn routekit_last_error() -> *const c_char {
-    LAST_ERROR.with(|e| {
-        match e.borrow().as_ref() {
-            Some(err) => {
-                match CString::new(err.as_str()) {
-                    Ok(c_str) => {
-                        let ptr = c_str.as_ptr();
-                        std::mem::forget(c_str);
-                        ptr
-                    }
-                    Err(_) => b"Failed to convert error message\0".as_ptr() as *const c_char,
-                }
-            }
-            None => b"No error\0".as_ptr() as *const c_char,
-        }
+    LAST_ERROR.with(|e| match e.borrow().as_ref() {
+        Some(err) => err.as_ptr(),
+        None => c"No error".as_ptr(),
     })
 }
 
 /// 检查RouteKit实例是否有效
+///
+/// # Safety
+/// The handle must be null or a pointer previously returned by `routekit_new`.
 #[no_mangle]
 pub unsafe extern "C" fn routekit_is_valid(handle: *mut c_void) -> bool {
     !handle.is_null()

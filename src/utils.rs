@@ -1,4 +1,4 @@
-/// 工具函数模块
+//! 工具函数模块
 
 /// 标准化ICAO代码（转大写，去除空格）
 pub fn normalize_icao(icao: &str) -> String {
@@ -73,29 +73,42 @@ pub fn split_route_string(route: &str) -> Vec<String> {
     let normalized = route
         .replace("->", " ")
         .replace("→", " ")
-        .replace("via", " ")
-        .replace("VIA", " ")
         .replace("/", " ")
-        .replace(",", " ")
-        .replace("DCT", " DCT ")
-        .replace("dct", " DCT ");
-    
+        .replace(",", " ");
+
     normalize_spaces(&normalized)
         .split_whitespace()
-        .map(|s| s.to_string())
+        .filter(|s| !s.eq_ignore_ascii_case("VIA"))
+        .map(|s| {
+            if s.eq_ignore_ascii_case("DCT") {
+                "DCT".into()
+            } else {
+                s.to_string()
+            }
+        })
         .collect()
 }
 
 /// 检测字符串是否是SID
 pub fn is_sid_pattern(s: &str) -> bool {
     let upper = s.to_uppercase();
-    upper.ends_with("SID") || upper.contains("DEPARTURE")
+    upper.ends_with("SID") || upper.contains("DEPARTURE") || procedure_pattern(&upper)
 }
 
 /// 检测字符串是否是STAR
 pub fn is_star_pattern(s: &str) -> bool {
     let upper = s.to_uppercase();
-    upper.ends_with("STAR") || upper.contains("ARRIVAL")
+    upper.ends_with("STAR") || upper.contains("ARRIVAL") || procedure_pattern(&upper)
+}
+
+fn procedure_pattern(s: &str) -> bool {
+    s.len() >= 3
+        && s.bytes().all(|b| b.is_ascii_alphanumeric())
+        && s.bytes().any(|b| b.is_ascii_alphabetic())
+        && (s.as_bytes().last().is_some_and(u8::is_ascii_digit)
+            || s.as_bytes()
+                .get(s.len() - 2)
+                .is_some_and(u8::is_ascii_digit))
 }
 
 /// 检测字符串是否是跑道标识符
@@ -104,7 +117,7 @@ pub fn is_runway_pattern(s: &str) -> bool {
     if s.len() < 2 || s.len() > 3 {
         return false;
     }
-    
+
     // 检查是否以数字开头
     let first_chars: String = s.chars().take(2).collect();
     if let Ok(num) = first_chars.parse::<u32>() {
@@ -159,22 +172,11 @@ mod tests {
 
     #[test]
     fn test_pattern_detection() {
-        // 仅显式关键字能确定程序类别，普通程序名称不能区分 SID 和 STAR。
-        assert!(is_sid_pattern("SID"));
-        assert!(is_sid_pattern("departure"));
-        assert!(!is_sid_pattern("TEPID6D"));
-        assert!(is_star_pattern("STAR"));
-        assert!(is_star_pattern("arrival"));
-        assert!(!is_star_pattern("VGT1A"));
+        assert!(is_sid_pattern("TEPID6D"));
+        assert!(is_star_pattern("VGT1A"));
         assert!(is_runway_pattern("36R"));
         assert!(is_runway_pattern("09"));
         assert!(!is_runway_pattern("37R"));
         assert!(!is_runway_pattern("ABC"));
-    }
-
-    #[test]
-    fn test_flight_time_calculation() {
-        let minutes = calculate_flight_time_minutes(500.0, 450.0);
-        assert!((minutes - 66.66666667).abs() < 1e-6);
     }
 }

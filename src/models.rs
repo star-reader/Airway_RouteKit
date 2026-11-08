@@ -168,35 +168,48 @@ impl Route {
     pub fn calculate_total_distance(&self) -> f64 {
         self.segments.iter().map(|s| s.distance_nm).sum()
     }
-    
+
     /// 生成航路字符串
     pub fn to_route_string(&self) -> String {
         let mut parts = Vec::new();
-        
+
         // 起飞机场
         parts.push(self.departure.identifier.clone());
-        
+
         // SID
         if let Some(sid) = &self.sid {
             parts.push(sid.procedure_identifier.clone());
         }
-        
-        // 航路段
-        for segment in &self.segments {
-            if let Some(airway) = &segment.airway {
-                parts.push(airway.clone());
-            }
-            parts.push(segment.to.identifier.clone());
+
+        if let Some(first) = self.segments.first() {
+            parts.push(first.from.identifier.clone());
         }
-        
+        let mut i = 0;
+        while i < self.segments.len() {
+            let segment = &self.segments[i];
+            parts.push(segment.airway.clone().unwrap_or_else(|| "DCT".into()));
+            let mut end = i;
+            if segment.airway.is_some() {
+                while end + 1 < self.segments.len()
+                    && self.segments[end + 1].airway == segment.airway
+                    && self.segments[end].to.identifier == self.segments[end + 1].from.identifier
+                    && self.segments[end].to.coordinate == self.segments[end + 1].from.coordinate
+                {
+                    end += 1;
+                }
+            }
+            parts.push(self.segments[end].to.identifier.clone());
+            i = end + 1;
+        }
+
         // STAR
         if let Some(star) = &self.star {
             parts.push(star.procedure_identifier.clone());
         }
-        
+
         // 目的机场
         parts.push(self.destination.identifier.clone());
-        
+
         parts.join(" ")
     }
 }

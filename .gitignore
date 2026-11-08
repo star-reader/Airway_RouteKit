@@ -22,3 +22,15 @@ target
 raw_data/*
 
 .vscode/
+
+# Generated release artifacts
+/libs/
+/dist/
+
+# Local reference source directories
+/source/
+/sources/
+
+# Compiler crash reports
+rustc-ice-*.txt
+__pycache__/

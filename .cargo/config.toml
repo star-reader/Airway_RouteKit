@@ -1,15 +1,4 @@
-[target.x86_64-unknown-linux-gnu]
-linker = "zig"
-
-[target.x86_64-unknown-linux-gnu.env]
-CC = "zig cc -target x86_64-linux-gnu.2.28"
-CXX = "zig c++ -target x86_64-linux-gnu.2.28"
-AR = "zig ar"
-
-[target.aarch64-unknown-linux-gnu]
-linker = "zig"
-
-[target.aarch64-unknown-linux-gnu.env]
-CC = "zig cc -target aarch64-linux-gnu.2.28"
-CXX = "zig c++ -target aarch64-linux-gnu.2.28"
-AR = "zig ar"
+# Makefile supplies target-specific linker flags through cargo-zigbuild.
+# Bundled SQLite must not be replaced with a host pkg-config library.
+[env]
+LIBSQLITE3_SYS_USE_PKG_CONFIG = { value = "0", force = true }

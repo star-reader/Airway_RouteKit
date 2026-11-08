@@ -1,122 +1,145 @@
-.PHONY: all build test test-verbose test-integration test-real-db clean doc examples bench fmt clippy install build-linux build-linux-amd64 build-linux-arm64 libs libs-linux
+SHELL := /bin/sh
+.DEFAULT_GOAL := all
+
+CARGO ?= cargo
+RUSTC ?= rustc
+CARGO_FLAGS ?=
+TARGET_DIR ?= $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
+CARGO_ZIGBUILD ?= $(if $(wildcard $(TARGET_DIR)/build-tools/bin/cargo-zigbuild),$(TARGET_DIR)/build-tools/bin/cargo-zigbuild,cargo-zigbuild)
+ZIGBUILD_VERSION := 0.23.2
+LIBS_DIR ?= libs
+DIST_DIR ?= dist
+PREFIX ?= /usr/local
+DESTDIR ?=
+NAVDATA ?= raw_data/e_dfd_PMDG.s3db
+DEPARTURE ?= ZBAA
+DESTINATION ?= ZSPD
+GO ?= go
+NATIVE_LIB_DIR = $(LIBS_DIR)/$(dir $(shell sh scripts/library-path.sh "$(NATIVE_TARGET)"))
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml)
+HOST_TARGET := $(shell $(RUSTC) -vV | sed -n 's/^host: //p')
+NATIVE_TARGET := $(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET),$(HOST_TARGET))
+NATIVE_RELEASE_DIR = $(TARGET_DIR)/$(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET)/)release
+LINUX_SONAME_ARG := -C link-arg=-Wl,-soname,libroutekit.so
+NATIVE_LINK_ARGS = $(if $(findstring -unknown-linux-gnu,$(NATIVE_TARGET)),-- $(LINUX_SONAME_ARG))
+LINUX_TARGET_AMD64 := x86_64-unknown-linux-gnu
+LINUX_TARGET_ARM64 := aarch64-unknown-linux-gnu
+LINUX_GLIBC ?= 2.28
+LINUX_ABI = $(if $(LINUX_GLIBC),.$(LINUX_GLIBC))
+LINUX_BUILD_ENV = LIBSQLITE3_SYS_USE_PKG_CONFIG=0 RUSTFLAGS="$(RUSTFLAGS) -C link-arg=-Wl,-soname,libroutekit.so"
+
+.PHONY: all build release ffi setup-cross check-cross build-linux build-linux-amd64 build-linux-arm64 \
+        libs libs-native libs-linux headers header package package-native \
+        test test-verbose check-all \
+        doc examples example-cpp example-go fmt fmt-check clippy clean install help
 
 all: build
 
 build:
-	@echo "building RouteKit..."
-	cargo build --release
+	$(CARGO) rustc --locked --release --lib --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS) $(NATIVE_LINK_ARGS)
 
-release:
-	@echo "building RouteKit release..."
-	cargo build --release
-
-LINUX_TARGET_AMD64 := x86_64-unknown-linux-gnu
-LINUX_TARGET_ARM64 := aarch64-unknown-linux-gnu
-LINUX_BUILD_ENV = LIBSQLITE3_SYS_USE_BUNDLED=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=0
+release ffi: build
 
 build-linux: build-linux-amd64
 
-build-linux-amd64:
-	@echo "building RouteKit release for linux amd64 ($(LINUX_TARGET_AMD64))"
-	$(LINUX_BUILD_ENV) cargo zigbuild --release --target $(LINUX_TARGET_AMD64)
+setup-cross:
+	$(CARGO) install --locked --root "$(TARGET_DIR)/build-tools" cargo-zigbuild --version "$(ZIGBUILD_VERSION)" $(CARGO_FLAGS)
 
-build-linux-arm64:
-	@echo "building RouteKit release for linux arm64 ($(LINUX_TARGET_ARM64))"
-	$(LINUX_BUILD_ENV) cargo zigbuild --release --target $(LINUX_TARGET_ARM64)
+check-cross:
+	sh scripts/check-cross.sh "$(CARGO_ZIGBUILD)"
 
-test:
-	@echo "running tests..."
-	cargo test
+build-linux-amd64: check-cross
+	$(LINUX_BUILD_ENV) "$(CARGO_ZIGBUILD)" zigbuild --locked --release --lib --target "$(LINUX_TARGET_AMD64)$(LINUX_ABI)" --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS)
 
-test-verbose:
-	@echo "running tests (verbose)..."
-	cargo test -- --nocapture
+build-linux-arm64: check-cross
+	$(LINUX_BUILD_ENV) "$(CARGO_ZIGBUILD)" zigbuild --locked --release --lib --target "$(LINUX_TARGET_ARM64)$(LINUX_ABI)" --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS)
 
-test-integration:
-	@echo "running integration tests..."
-	cargo test --test integration_test
-
-test-real-db:
-	@echo "running optional navigation database regressions..."
-	cargo test --test real_database -- --ignored
-
-doc:
-	@echo "generating documentation..."
-	cargo doc --no-deps --open
-
-examples:
-	@echo "running basic example..."
-	cargo run --example basic_usage
-	@echo "\nrunning parsing example..."
-	cargo run --example advanced_parsing
-
-bench:
-	@echo "running performance benchmarks..."
-	cargo bench --bench routekit
-
-fmt:
-	@echo "formatting code..."
-	cargo fmt
-
-clippy:
-	@echo "checking code..."
-	cargo clippy -- -D warnings
-
-clean:
-	@echo "cleaning build artifacts..."
-	cargo clean
-
-install:
-	@echo "installing to system..."
-	cargo install --path .
-
-check-all: fmt clippy test
-	@echo "all checks passed"
-
-ffi:
-	@echo "building FFI library..."
-	cargo build --release
-	@echo "FFI library generated:"
-	@echo "  Linux:   target/release/libroutekit.so"
-	@echo "  macOS:   target/release/libroutekit.dylib"
-	@echo "  Windows: target/release/routekit.dll"
-
-libs: build libs-linux
-
-libs-linux: build-linux-amd64 build-linux-arm64
-	@echo "copying shared libraries to libs/..."
-	mkdir -p libs/linux/amd64 libs/linux/arm64 libs/macos
-	cp target/$(LINUX_TARGET_AMD64)/release/libroutekit.so libs/linux/amd64/libroutekit.so
-	cp target/$(LINUX_TARGET_ARM64)/release/libroutekit.so libs/linux/arm64/libroutekit.so
-	cp target/release/libroutekit.dylib libs/macos/libroutekit.dylib
-	@echo "done:"
-	@file libs/linux/amd64/libroutekit.so
-	@file libs/linux/arm64/libroutekit.so
-	@file libs/macos/libroutekit.dylib
+headers:
+	mkdir -p "$(LIBS_DIR)"
+	cp routekit.h routekit_advanced.h "$(LIBS_DIR)/"
 
 header:
-	@echo "header file located at: routekit.h"
+	@printf '%s\n' 'Public header: routekit.h' 'Additive interfaces: routekit_advanced.h'
+
+libs-native: build headers
+	sh scripts/stage-library.sh "$(NATIVE_TARGET)" "$(NATIVE_RELEASE_DIR)" "$(LIBS_DIR)"
+
+libs-linux: build-linux-amd64 build-linux-arm64 headers
+	sh scripts/stage-library.sh "$(LINUX_TARGET_AMD64)" "$(TARGET_DIR)/$(LINUX_TARGET_AMD64)/release" "$(LIBS_DIR)"
+	sh scripts/stage-library.sh "$(LINUX_TARGET_ARM64)" "$(TARGET_DIR)/$(LINUX_TARGET_ARM64)/release" "$(LIBS_DIR)"
+
+# Stage the native macOS library alongside both Linux targets.
+libs: build libs-linux
+	@case "$(NATIVE_TARGET)" in \
+	  *-apple-darwin) sh scripts/stage-library.sh "$(NATIVE_TARGET)" "$(NATIVE_RELEASE_DIR)" "$(LIBS_DIR)" ;; \
+	  *-unknown-linux-gnu) printf '%s\n' 'Linux libraries staged; build libs-native on macOS for the macOS library.' ;; \
+	  *) printf '%s\n' 'Unsupported native platform for make libs.' >&2; exit 1 ;; \
+	esac
+
+package: libs
+	sh scripts/package.sh "$(LIBS_DIR)" "$(DIST_DIR)" "$(VERSION)" all
+
+package-native: libs-native
+	sh scripts/package.sh "$(LIBS_DIR)" "$(DIST_DIR)" "$(VERSION)" "$(NATIVE_TARGET)"
+
+test:
+	$(CARGO) test --locked --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS)
+
+test-verbose:
+	$(CARGO) test --locked --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS) -- --nocapture
+
+doc:
+	$(CARGO) doc --locked --no-deps --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS)
+
+examples:
+	$(CARGO) run --locked --release --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS) --example basic_usage -- "$(NAVDATA)" "$(DEPARTURE)" "$(DESTINATION)"
+	$(CARGO) run --locked --release --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS) --example advanced_parsing -- "$(NAVDATA)"
+	$(CARGO) run --locked --release --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS) --example advanced_usage -- "$(NAVDATA)" "$(DEPARTURE)" "$(DESTINATION)"
+
+example-cpp: libs-native
+	mkdir -p "$(TARGET_DIR)/examples"
+	$(CXX) -std=c++17 -Wall -Wextra -Werror -I"$(LIBS_DIR)" examples/ffi_example.cpp -L"$(abspath $(NATIVE_LIB_DIR))" -lroutekit "-Wl,-rpath,$(abspath $(NATIVE_LIB_DIR))" -o "$(TARGET_DIR)/examples/ffi_example"
+	"$(TARGET_DIR)/examples/ffi_example" "$(NAVDATA)"
+
+example-go: libs-native
+	CGO_ENABLED=1 CGO_LDFLAGS="-L$(abspath $(NATIVE_LIB_DIR)) -Wl,-rpath,$(abspath $(NATIVE_LIB_DIR))" $(GO) run examples/ffi_example.go "$(NAVDATA)" "$(DEPARTURE)" "$(DESTINATION)"
+
+fmt:
+	$(CARGO) fmt --all
+
+fmt-check:
+	$(CARGO) fmt --all -- --check
+
+clippy:
+	$(CARGO) clippy --locked --all-targets --target-dir "$(TARGET_DIR)" $(CARGO_FLAGS) -- -D warnings
+
+check-all: fmt-check clippy test
+
+clean:
+	$(CARGO) clean --target-dir "$(TARGET_DIR)"
+
+# Install actual library files; this crate has no cargo-installable executable.
+install: libs-native
+	sh scripts/install.sh "$(NATIVE_TARGET)" "$(LIBS_DIR)" "$(DESTDIR)$(PREFIX)"
 
 help:
-	@echo "RouteKit build system"
-	@echo ""
-	@echo "Available targets:"
-	@echo "  make build           - Build project (debug version)"
-	@echo "  make release         - Build release version"
-	@echo "  make build-linux     - Build Linux release (amd64, alias)"
-	@echo "  make build-linux-amd64 - Build Linux release for x86_64"
-	@echo "  make build-linux-arm64 - Build Linux release for aarch64"
-	@echo "  make libs            - Build and copy macOS/Linux shared libraries"
-	@echo "  make test            - Run tests without an external navigation database"
-	@echo "  make test-verbose    - Run tests (verbose output)"
-	@echo "  make test-integration- Run integration tests"
-	@echo "  make test-real-db    - Run optional navigation database regressions"
-	@echo "  make doc             - Generate and open documentation"
-	@echo "  make examples        - Run example programs"
-	@echo "  make bench           - Run performance benchmarks"
-	@echo "  make fmt             - Format code"
-	@echo "  make clippy          - Code quality check"
-	@echo "  make clean           - Clean build artifacts"
-	@echo "  make check-all       - Run all checks"
-	@echo "  make ffi             - Build FFI library"
-	@echo "  make help            - Show this help message"
+	@printf '%s\n' \
+	  'RouteKit build system' \
+	  '  make build / release / ffi  Build native release libraries' \
+	  '  make build-linux           Build Linux amd64 (alias)' \
+	  '  make setup-cross           Install pinned cross-build tool under target/build-tools' \
+	  '  make build-linux-amd64     Build Linux x86_64 using cargo-zigbuild' \
+	  '  make build-linux-arm64     Build Linux aarch64 using cargo-zigbuild' \
+	  '  make libs                  Stage native macOS and both Linux libraries' \
+	  '  make libs-native           Stage only the current target library and headers' \
+	  '  make libs-linux            Stage Linux amd64 and arm64 libraries' \
+	  '  make package               Archive macOS + Linux bundle (macOS library required)' \
+	  '  make package-native        Archive only the current target' \
+	  '  make test / test-verbose   Run ordinary tests' \
+	  '  make examples              Run Rust calling examples' \
+	  '  make example-cpp / example-go  Build and run native FFI examples' \
+	  '  make fmt / clippy / check-all / doc' \
+	  '  make install PREFIX=...    Install native shared library and headers' \
+	  '  make clean                 Clean Cargo artifacts' \
+	  'Options: CARGO_FLAGS=--offline NAVDATA=... DEPARTURE=ZBAA DESTINATION=ZSPD LIBS_DIR=libs DIST_DIR=dist' \
+	  'Linux tools: Zig, cargo-zigbuild, installed Rust Linux targets; glibc default: 2.28'

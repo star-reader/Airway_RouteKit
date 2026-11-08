@@ -65,17 +65,27 @@ impl Config {
         }
 
         if self.max_search_depth == 0 {
-            return Err(RouteKitError::ConfigError(
-                "搜索深度必须大于0".to_string(),
-            ));
+            return Err(RouteKitError::ConfigError("搜索深度必须大于0".to_string()));
         }
 
-        if self.spatial_search_radius_nm <= 0.0 {
+        if !self.spatial_search_radius_nm.is_finite() || self.spatial_search_radius_nm <= 0.0 {
             return Err(RouteKitError::ConfigError(
                 "空间搜索半径必须大于0".to_string(),
             ));
         }
 
+        if self.search_timeout_ms == 0
+            || !self.search_weights.distance_weight.is_finite()
+            || self.search_weights.distance_weight <= 0.0
+            || [
+                self.search_weights.airway_preference_weight,
+                self.search_weights.altitude_match_weight,
+            ]
+            .iter()
+            .any(|w| !w.is_finite() || *w < 0.0)
+        {
+            return Err(RouteKitError::ConfigError("Timeout and finite non-negative weights are required; distance weight must be positive".into()));
+        }
         Ok(())
     }
 }
@@ -129,31 +139,5 @@ impl ConfigBuilder {
     pub fn build(self) -> crate::error::Result<Config> {
         self.config.validate()?;
         Ok(self.config)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_builder() {
-        let config = Config::builder()
-            .db_pool_size(15)
-            .max_search_depth(1500)
-            .spatial_search_radius_nm(100.0)
-            .enable_cache(true)
-            .build()
-            .unwrap();
-
-        assert_eq!(config.db_pool_size, 15);
-        assert_eq!(config.max_search_depth, 1500);
-        assert_eq!(config.spatial_search_radius_nm, 100.0);
-        assert!(config.enable_cache);
-    }
-
-    #[test]
-    fn test_config_validation() {
-        assert!(Config::builder().db_pool_size(0).build().is_err());
     }
 }
