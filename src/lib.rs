@@ -7,7 +7,7 @@
 //! use routekit::{RouteKit, RouteRequest, FlightLevel, RoutePreference};
 //!
 //! // 创建RouteKit实例
-//! let kit = RouteKit::new("path/to/database.s3db").unwrap();
+//! let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
 //!
 //! // 查询航路
 //! let request = RouteRequest {
@@ -79,7 +79,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::RouteKit;
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// ```
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let config = Config::default();
@@ -104,7 +104,7 @@ impl RouteKit {
     ///     .build()
     ///     .unwrap();
     ///
-    /// let kit = RouteKit::with_config("raw_data/e_dfd_PMDG.s3db", config).unwrap();
+    /// let kit = RouteKit::with_config("raw_data/e_navdata.s3db", config).unwrap();
     /// ```
     pub fn with_config<P: AsRef<Path>>(db_path: P, config: Config) -> Result<Self> {
         config.validate()?;
@@ -166,7 +166,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::{RouteKit, RouteRequest, FlightLevel, RoutePreference};
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// let request = RouteRequest {
     ///     departure_icao: "ZBAA".to_string(),
     ///     destination_icao: "ZSPD".to_string(),
@@ -219,7 +219,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::{RouteKit, RouteRequest};
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// let request = RouteRequest {
     ///     departure_icao: "ZBAA".to_string(),
     ///     destination_icao: "ZSPD".to_string(),
@@ -264,7 +264,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::RouteKit;
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// let parsed = kit.parse_route("ZBAA SID TEPID G212 VYK STAR ZSPD").unwrap();
     ///
     /// if parsed.is_valid {

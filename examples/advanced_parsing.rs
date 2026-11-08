@@ -4,7 +4,7 @@ fn main() -> routekit::Result<()> {
     let mut args = std::env::args().skip(1);
     let database = args
         .next()
-        .unwrap_or_else(|| "raw_data/e_dfd_PMDG.s3db".into());
+        .unwrap_or_else(|| "raw_data/e_navdata.s3db".into());
     let input = args.collect::<Vec<_>>().join(" ");
     let input = if input.is_empty() {
         "ZBAA ELKUR W40 YQG W142 DALIM A593 VMB W161 SASAN ZSPD".to_owned()

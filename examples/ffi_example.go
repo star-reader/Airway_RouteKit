@@ -94,7 +94,7 @@ func (kit *RouteKit) ParseRoute(input string) (*ParsedRoute, error) {
 }
 
 func run() error {
-	database, departure, destination := "raw_data/e_dfd_PMDG.s3db", "ZBAA", "ZSPD"
+	database, departure, destination := "raw_data/e_navdata.s3db", "ZBAA", "ZSPD"
 	if len(os.Args) > 1 {
 		database = os.Args[1]
 	}

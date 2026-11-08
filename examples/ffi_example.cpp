@@ -14,7 +14,7 @@ void print_result(char* result) {
 
 int main(int argc, char** argv) {
     try {
-        const char* database = argc > 1 ? argv[1] : "raw_data/e_dfd_PMDG.s3db";
+        const char* database = argc > 1 ? argv[1] : "raw_data/e_navdata.s3db";
         Kit kit(routekit_new(database), routekit_free);
         if (!kit) throw std::runtime_error(routekit_last_error());
         print_result(routekit_find_routes(kit.get(), "ZBAA", "ZSPD", 1));
