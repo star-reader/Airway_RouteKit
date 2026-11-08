@@ -5,6 +5,8 @@
 
 A Rust library for procedure-aware enroute routing and navigation-string parsing, with a C ABI for C++, Go, and other languages. It reads a local navigation database and returns routes, segment details, and optional planning diagnostics.
 
+[**Algorithm and implementation reference**](docs/algorithm-reference.md) — detailed architecture, formulas, search logic, validation, results, and limitations.
+
 ## Features
 
 - Directed-airway search with altitude constraints, verified SID/STAR boundaries, and route preferences.
