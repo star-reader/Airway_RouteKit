@@ -17,11 +17,10 @@ else
     name="$name-$mode"
 fi
 # Validate before making or replacing an archive. Never include navigation data.
-for path in $files routekit.h routekit_advanced.h; do
+for path in $files routekit.h; do
     [ -s "$libs/$path" ] || { echo "Missing package input: $libs/$path" >&2; exit 1; }
 done
 cmp routekit.h "$libs/routekit.h"
-cmp routekit_advanced.h "$libs/routekit_advanced.h"
 mkdir -p "$dist"
 staging=$(mktemp -d "$dist/.routekit.XXXXXX")
 archive="$dist/$name.tar.gz"
@@ -30,7 +29,7 @@ trap 'rm -rf "$staging"; rm -f "$partial"' EXIT
 trap 'exit 1' HUP INT TERM
 root="$staging/$name"
 mkdir -p "$root/libs"
-cp "$libs/routekit.h" "$libs/routekit_advanced.h" LICENSE README.md "$root/"
+cp "$libs/routekit.h" LICENSE README.md "$root/"
 for path in $files; do
     mkdir -p "$root/libs/$(dirname "$path")"
     cp "$libs/$path" "$root/libs/$path"

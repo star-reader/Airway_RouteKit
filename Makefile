@@ -56,10 +56,10 @@ build-linux-arm64: check-cross
 
 headers:
 	mkdir -p "$(LIBS_DIR)"
-	cp routekit.h routekit_advanced.h "$(LIBS_DIR)/"
+	cp routekit.h "$(LIBS_DIR)/"
 
 header:
-	@printf '%s\n' 'Public header: routekit.h' 'Additive interfaces: routekit_advanced.h'
+	@printf '%s\n' 'Public header: routekit.h (all FFI interfaces)'
 
 libs-native: build headers
 	sh scripts/stage-library.sh "$(NATIVE_TARGET)" "$(NATIVE_RELEASE_DIR)" "$(LIBS_DIR)"
@@ -131,7 +131,7 @@ help:
 	  '  make build-linux-amd64     Build Linux x86_64 using cargo-zigbuild' \
 	  '  make build-linux-arm64     Build Linux aarch64 using cargo-zigbuild' \
 	  '  make libs                  Stage native macOS and both Linux libraries' \
-	  '  make libs-native           Stage only the current target library and headers' \
+	  '  make libs-native           Stage only the current target library and header' \
 	  '  make libs-linux            Stage Linux amd64 and arm64 libraries' \
 	  '  make package               Archive macOS + Linux bundle (macOS library required)' \
 	  '  make package-native        Archive only the current target' \
@@ -139,7 +139,7 @@ help:
 	  '  make examples              Run Rust calling examples' \
 	  '  make example-cpp / example-go  Build and run native FFI examples' \
 	  '  make fmt / clippy / check-all / doc' \
-	  '  make install PREFIX=...    Install native shared library and headers' \
+	  '  make install PREFIX=...    Install native shared library and header' \
 	  '  make clean                 Clean Cargo artifacts' \
 	  'Options: CARGO_FLAGS=--offline NAVDATA=... DEPARTURE=ZBAA DESTINATION=ZSPD LIBS_DIR=libs DIST_DIR=dist' \
 	  'Linux tools: Zig, cargo-zigbuild, installed Rust Linux targets; glibc default: 2.28'
