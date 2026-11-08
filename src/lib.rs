@@ -336,18 +336,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_routekit_creation() {
-    }
-
-    #[test]
     fn test_coordinate_creation() {
         let coord = Coordinate::new(40.0, 116.0).unwrap();
         assert_eq!(coord.latitude, 40.0);
         assert_eq!(coord.longitude, 116.0);
 
+        assert!(Coordinate::new(-90.0, -180.0).is_ok());
+        assert!(Coordinate::new(90.0, 180.0).is_ok());
+
         // 测试无效坐标
-        assert!(Coordinate::new(100.0, 0.0).is_err());
-        assert!(Coordinate::new(0.0, 200.0).is_err());
+        assert!(Coordinate::new(91.0, 0.0).is_err());
+        assert!(Coordinate::new(-91.0, 0.0).is_err());
+        assert!(Coordinate::new(0.0, 181.0).is_err());
+        assert!(Coordinate::new(0.0, -181.0).is_err());
     }
 
     #[test]

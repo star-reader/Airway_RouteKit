@@ -1,8 +1,9 @@
-use routekit::{RouteElement, RouteKit};
+//! 默认集成测试和基准共用的临时导航数据库，无需本地航行数据。
+
 use rusqlite::{params, Connection};
 use tempfile::NamedTempFile;
 
-fn setup_parser_db() -> NamedTempFile {
+pub fn setup_parser_db() -> NamedTempFile {
     let tmp = NamedTempFile::new().expect("create temp db");
     let conn = Connection::open(tmp.path()).expect("open temp db");
 
@@ -143,6 +144,8 @@ fn setup_parser_db() -> NamedTempFile {
     insert_wp(&conn, "AND", "ZS", 30.25666667, 121.22166667, "Enroute");
     insert_wp(&conn, "AND", "EN", 69.28782778, 16.14137778, "VOR");
     insert_vor(&conn, "AND", "ZS", "AND VOR", 30.25666667, 121.22166667);
+    // 仅存在于 VOR 表，避免航路航点掩盖 VOR 回退读取失效。
+    insert_vor(&conn, "VORPT", "ZS", "VOR ONLY", 30.85, 121.05);
     insert_wp(&conn, "CHI", "ZY", 39.20, 122.90, "Enroute");
     insert_wp(&conn, "CHI", "YB", -12.55, 130.86666667, "Enroute");
     insert_wp(&conn, "NEAR1", "ZS", 35.15, 120.69, "Enroute");
@@ -176,7 +179,15 @@ fn insert_wp(conn: &Connection, id: &str, icao: &str, lat: f64, lon: f64, wp_typ
     .unwrap();
 }
 
-fn insert_airway_seg(conn: &Connection, route: &str, seqno: i32, id: &str, lat: f64, lon: f64, icao: &str) {
+fn insert_airway_seg(
+    conn: &Connection,
+    route: &str,
+    seqno: i32,
+    id: &str,
+    lat: f64,
+    lon: f64,
+    icao: &str,
+) {
     conn.execute(
         "INSERT INTO tbl_enroute_airways
          (route_identifier, seqno, waypoint_identifier, waypoint_latitude, waypoint_longitude, icao_code, route_type,
@@ -217,212 +228,4 @@ fn insert_terminal_ndb(conn: &Connection, id: &str, icao: &str, name: &str, lat:
         params![icao, id, name, lat, lon],
     )
     .unwrap();
-}
-
-fn get_first_airway_segments(parsed: &routekit::ParsedRoute, airway_id: &str) -> Vec<routekit::AirwaySegment> {
-    parsed
-        .elements
-        .iter()
-        .find_map(|e| match e {
-            RouteElement::Airway { identifier, segments } if identifier == airway_id => Some(segments.clone()),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-fn find_resolved_waypoint(parsed: &routekit::ParsedRoute, identifier: &str) -> Option<routekit::Waypoint> {
-    for element in &parsed.elements {
-        match element {
-            RouteElement::Waypoint(wp) if wp.identifier == identifier => return Some(wp.clone()),
-            RouteElement::Direct { from, to } => {
-                if from.identifier == identifier {
-                    return Some(from.clone());
-                }
-                if to.identifier == identifier {
-                    return Some(to.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-#[test]
-fn test_consecutive_waypoints_emit_implicit_dct_segments() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("SUPAR AND MULOV").expect("parse");
-
-    let direct_count = parsed
-        .elements
-        .iter()
-        .filter(|e| matches!(e, RouteElement::Direct { .. }))
-        .count();
-    assert_eq!(direct_count, 2, "two consecutive hops should emit two DCT segments");
-
-    let first_is_waypoint = matches!(parsed.elements.first(), Some(RouteElement::Waypoint(wp)) if wp.identifier == "SUPAR");
-    assert!(first_is_waypoint, "first fix should remain a Waypoint element");
-}
-
-#[test]
-fn test_dct_duplicate_waypoint_prefers_nearest_continuity() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("SUPAR DCT AND").expect("parse");
-    let direct_to = parsed.elements.iter().find_map(|e| match e {
-        RouteElement::Direct { to, .. } => Some(to.clone()),
-        _ => None,
-    });
-
-    let to = direct_to.expect("should produce DCT segment");
-    assert_eq!(to.icao_code, "ZS");
-    assert!((to.coordinate.latitude - 30.25666667).abs() < 0.001);
-}
-
-#[test]
-fn test_airway_duplicate_waypoint_prefers_contextual_match() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("SUPAR B221 AND").expect("parse");
-    let segments = get_first_airway_segments(&parsed, "B221");
-    assert!(!segments.is_empty());
-
-    let last = segments.last().unwrap();
-    assert_eq!(last.waypoint.identifier, "AND");
-    assert_eq!(last.waypoint.icao_code, "ZS");
-    assert!((last.waypoint.coordinate.latitude - 30.25666667).abs() < 0.001);
-}
-
-#[test]
-fn test_airway_reverse_direction_segment_extraction() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("SUPAR W90 TEPID").expect("parse");
-    let segments = get_first_airway_segments(&parsed, "W90");
-
-    assert_eq!(segments.len(), 3);
-    assert_eq!(segments.first().unwrap().waypoint.identifier, "SUPAR");
-    assert_eq!(segments.last().unwrap().waypoint.identifier, "TEPID");
-}
-
-#[test]
-fn test_unknown_waypoint_kept_as_unknown_token() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("SUPAR NOTEXIST").expect("parse");
-    let has_unknown = parsed
-        .elements
-        .iter()
-        .any(|e| matches!(e, RouteElement::Unknown(x) if x == "NOTEXIST"));
-    assert!(has_unknown);
-}
-
-#[test]
-fn test_vor_is_loaded_as_waypoint_candidate() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("SUPAR DCT AND").expect("parse");
-    let direct_to = parsed.elements.iter().find_map(|e| match e {
-        RouteElement::Direct { to, .. } => Some(to.clone()),
-        _ => None,
-    });
-
-    let to = direct_to.expect("should produce DCT segment");
-    assert_eq!(to.identifier, "AND");
-    // Because enroute and VOR both exist for AND, this ensures the parser still resolves it successfully.
-    assert!(matches!(to.waypoint_type, routekit::WaypointType::Enroute | routekit::WaypointType::VOR));
-}
-
-#[test]
-fn test_ndb_tables_are_used_for_waypoint_resolution() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("ZGGG SID NDBA NDBT ZSPD").expect("parse");
-
-    let ndb_waypoints: Vec<_> = ["NDBA", "NDBT"]
-        .iter()
-        .filter_map(|id| find_resolved_waypoint(&parsed, id))
-        .collect();
-
-    assert_eq!(ndb_waypoints.len(), 2);
-    assert!(ndb_waypoints
-        .iter()
-        .all(|wp| matches!(wp.waypoint_type, routekit::WaypointType::NDB)));
-}
-
-#[test]
-fn test_airway_endpoint_token_is_not_reparsed_as_unknown() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit
-        .parse_route("ZGGG TAN W24 TEPID W90 NOLON A599 ELNEX G204 MULOV V73 SUPAR B221 AND ZSPD")
-        .expect("parse");
-
-    let has_and_unknown = parsed
-        .warnings
-        .iter()
-        .any(|w| w.contains("无法识别的元素: AND"));
-    assert!(!has_and_unknown, "AND should be consumed by airway endpoint, got warnings: {:?}", parsed.warnings);
-}
-
-#[test]
-fn test_first_token_after_departure_is_not_forced_sid() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("ZYHB HRB NODAL VENOS ZUCK").expect("parse");
-
-    let has_sid = parsed
-        .elements
-        .iter()
-        .any(|e| matches!(e, RouteElement::SID(_)));
-    assert!(!has_sid, "HRB should be parsed as waypoint, not SID");
-
-    let first_wp = parsed.elements.iter().find_map(|e| match e {
-        RouteElement::Waypoint(wp) => Some(wp.identifier.clone()),
-        _ => None,
-    });
-    assert_eq!(first_wp.as_deref(), Some("HRB"));
-}
-
-#[test]
-fn test_duplicate_identifier_prefers_local_continuity_over_far_region() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit.parse_route("ZYHB HRB NODAL CHI VENOS ZUCK").expect("parse");
-    let chi = find_resolved_waypoint(&parsed, "CHI").expect("CHI should be parsed");
-    assert_eq!(chi.icao_code, "ZY");
-    assert!(chi.coordinate.latitude > 0.0, "should not jump to YB/Channel Island candidate");
-}
-
-#[test]
-fn test_single_far_candidate_is_skipped_instead_of_forced_match() {
-    let db = setup_parser_db();
-    let kit = RouteKit::new(db.path()).expect("init routekit");
-
-    let parsed = kit
-        .parse_route("ZYHB NEAR1 FARPT ZSPD")
-        .expect("parse");
-
-    let has_farpt = parsed.elements.iter().any(|e| match e {
-        RouteElement::Waypoint(wp) => wp.identifier == "FARPT",
-        _ => false,
-    });
-    assert!(!has_farpt, "FARPT should be skipped when only far candidate exists");
-
-    let has_unknown_farpt = parsed.elements.iter().any(|e| match e {
-        RouteElement::Unknown(id) => id == "FARPT",
-        _ => false,
-    });
-    assert!(has_unknown_farpt, "FARPT should remain as unknown token");
 }

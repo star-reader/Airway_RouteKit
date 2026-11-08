@@ -131,3 +131,29 @@ impl ConfigBuilder {
         Ok(self.config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_builder() {
+        let config = Config::builder()
+            .db_pool_size(15)
+            .max_search_depth(1500)
+            .spatial_search_radius_nm(100.0)
+            .enable_cache(true)
+            .build()
+            .unwrap();
+
+        assert_eq!(config.db_pool_size, 15);
+        assert_eq!(config.max_search_depth, 1500);
+        assert_eq!(config.spatial_search_radius_nm, 100.0);
+        assert!(config.enable_cache);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        assert!(Config::builder().db_pool_size(0).build().is_err());
+    }
+}

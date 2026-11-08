@@ -820,12 +820,10 @@ mod tests {
     #[test]
     fn test_normalize_input() {
         let input = "ZBAA -> TEPID via G212 DCT VYK STAR ZSPD";
-        let parser = RouteParser::new(Arc::new(
-            DatabasePool::new("test.db", 1).unwrap()
-        ));
+        let db = tempfile::NamedTempFile::new().expect("create temp database");
+        let parser = RouteParser::new(Arc::new(DatabasePool::new(db.path(), 1).unwrap()));
         let normalized = parser.normalize_input(input);
-        assert!(normalized.contains("ZBAA"));
-        assert!(normalized.contains("ZSPD"));
+        assert_eq!(normalized, "ZBAA TEPID VIA G212 DCT VYK STAR ZSPD");
     }
 
     #[test]

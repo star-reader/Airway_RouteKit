@@ -751,9 +751,12 @@ mod tests {
 
     #[test]
     fn test_database_pool_creation() {
-        if std::path::Path::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db").exists() {
-            let pool = DatabasePool::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db", 5);
-            assert!(pool.is_ok());
-        }
+        let db = tempfile::NamedTempFile::new().expect("create temp database");
+        let pool = DatabasePool::new(db.path(), 5).expect("create connection pool");
+        let connection = pool.get_connection().expect("get pooled connection");
+        let value: i32 = connection
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 1);
     }
 }

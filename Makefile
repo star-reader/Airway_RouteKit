@@ -1,4 +1,4 @@
-.PHONY: all build test clean doc examples bench fmt clippy install build-linux build-linux-amd64 build-linux-arm64 libs libs-linux
+.PHONY: all build test test-verbose test-integration test-real-db clean doc examples bench fmt clippy install build-linux build-linux-amd64 build-linux-arm64 libs libs-linux
 
 all: build
 
@@ -36,6 +36,10 @@ test-integration:
 	@echo "running integration tests..."
 	cargo test --test integration_test
 
+test-real-db:
+	@echo "running optional navigation database regressions..."
+	cargo test --test real_database -- --ignored
+
 doc:
 	@echo "generating documentation..."
 	cargo doc --no-deps --open
@@ -48,7 +52,7 @@ examples:
 
 bench:
 	@echo "running performance benchmarks..."
-	cargo bench
+	cargo bench --bench routekit
 
 fmt:
 	@echo "formatting code..."
@@ -103,9 +107,10 @@ help:
 	@echo "  make build-linux-amd64 - Build Linux release for x86_64"
 	@echo "  make build-linux-arm64 - Build Linux release for aarch64"
 	@echo "  make libs            - Build and copy macOS/Linux shared libraries"
-	@echo "  make test            - Run all tests"
+	@echo "  make test            - Run tests without an external navigation database"
 	@echo "  make test-verbose    - Run tests (verbose output)"
 	@echo "  make test-integration- Run integration tests"
+	@echo "  make test-real-db    - Run optional navigation database regressions"
 	@echo "  make doc             - Generate and open documentation"
 	@echo "  make examples        - Run example programs"
 	@echo "  make bench           - Run performance benchmarks"

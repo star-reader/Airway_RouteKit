@@ -1,175 +1,263 @@
-/// 集成测试
+//! 无需外部数据库的公共 API 和航路解析回归测试。
 
-use routekit::*;
+#[path = "support/database.rs"]
+mod database;
+#[path = "support/route.rs"]
+mod route;
 
-const TEST_DB_PATH: &str = "raw_data/e_dfd_PMDG.s3db";
+use database::setup_parser_db;
+use route::find_resolved_waypoint;
+use routekit::{RouteElement, RouteKit};
 
 #[test]
 fn test_routekit_initialization() {
-    // 如果数据库文件不存在，跳过测试
-    if !std::path::Path::new(TEST_DB_PATH).exists() {
-        println!("跳过测试：数据库文件不存在");
-        return;
-    }
-
-    let kit = RouteKit::new(TEST_DB_PATH);
-    assert!(kit.is_ok(), "RouteKit初始化失败");
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("initialize RouteKit with fixture database");
+    let coordinate = routekit::Coordinate::new(30.90, 121.10).unwrap();
+    let nearest = kit
+        .find_nearest_waypoint(&coordinate)
+        .expect("spatial index should be populated");
+    assert_eq!(nearest.identifier, "TEPID");
 }
 
 #[test]
 fn test_load_airport() {
-    if !std::path::Path::new(TEST_DB_PATH).exists() {
-        println!("跳过测试：数据库文件不存在");
-        return;
-    }
-
-    let kit = RouteKit::new(TEST_DB_PATH).unwrap();
-    
-    // 测试加载北京首都国际机场
-    let result = kit.load_airport("ZBAA");
-    if let Ok(airport) = result {
-        assert_eq!(airport.identifier, "ZBAA");
-        println!("成功加载机场: {} ({:?})", airport.identifier, airport.name);
-    }
-}
-
-#[test]
-fn test_coordinate_validation() {
-    // 有效坐标
-    assert!(Coordinate::new(40.0, 116.0).is_ok());
-    assert!(Coordinate::new(-90.0, -180.0).is_ok());
-    assert!(Coordinate::new(90.0, 180.0).is_ok());
-    
-    // 无效坐标
-    assert!(Coordinate::new(91.0, 0.0).is_err());
-    assert!(Coordinate::new(-91.0, 0.0).is_err());
-    assert!(Coordinate::new(0.0, 181.0).is_err());
-    assert!(Coordinate::new(0.0, -181.0).is_err());
-}
-
-#[test]
-fn test_distance_calculation() {
-    use routekit::geo::haversine_distance_nm;
-    
-    // 北京到上海的距离
-    let beijing = Coordinate::new(39.9042, 116.4074).unwrap();
-    let shanghai = Coordinate::new(31.2304, 121.4737).unwrap();
-    
-    let distance = haversine_distance_nm(&beijing, &shanghai);
-    
-    // 实际距离约为534海里
-    assert!(distance > 500.0 && distance < 600.0, "距离计算异常: {}", distance);
-    println!("北京到上海距离: {:.2} 海里", distance);
-}
-
-#[test]
-fn test_config_builder() {
-    let config = Config::builder()
-        .db_pool_size(15)
-        .max_search_depth(1500)
-        .spatial_search_radius_nm(100.0)
-        .enable_cache(true)
-        .build();
-    
-    assert!(config.is_ok());
-    let config = config.unwrap();
-    assert_eq!(config.db_pool_size, 15);
-    assert_eq!(config.max_search_depth, 1500);
-}
-
-#[test]
-fn test_config_validation() {
-    // 无效配置：连接池大小为0
-    let config = Config::builder()
-        .db_pool_size(0)
-        .build();
-    
-    assert!(config.is_err());
-}
-
-#[test]
-fn test_utils_functions() {
-    use routekit::utils::*;
-    
-    // 测试ICAO验证
-    assert!(validate_icao("ZBAA"));
-    assert!(validate_icao("ZSPD"));
-    assert!(!validate_icao("ZBA"));
-    assert!(!validate_icao("12345"));
-    
-    // 测试单位转换
-    let nm = 100.0;
-    let km = nm_to_km(nm);
-    assert!((km - 185.2).abs() < 0.1);
-    assert!((km_to_nm(km) - nm).abs() < 0.1);
-    
-    // 测试航路字符串分割
-    let route = "ZBAA SID TEPID G212 VYK STAR ZSPD";
-    let parts = split_route_string(route);
-    assert!(parts.contains(&"ZBAA".to_string()));
-    assert!(parts.contains(&"G212".to_string()));
-    assert!(parts.contains(&"ZSPD".to_string()));
-}
-
-#[test]
-fn test_route_request_creation() {
-    use routekit::route::RouteRequestBuilder;
-    
-    let request = RouteRequestBuilder::new("ZBAA", "ZSPD")
-        .flight_level(FlightLevel::High)
-        .route_preference(RoutePreference::AirwayPreferred)
-        .max_routes(5)
-        .build();
-    
-    assert_eq!(request.departure_icao, "ZBAA");
-    assert_eq!(request.destination_icao, "ZSPD");
-    assert_eq!(request.max_routes, 5);
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+    let airport = kit
+        .load_airport("ZSPD")
+        .expect("fixture airport should load");
+    assert_eq!(airport.identifier, "ZSPD");
+    assert!((airport.coordinate.latitude - 31.1434).abs() < 1e-6);
+    assert!((airport.coordinate.longitude - 121.8052).abs() < 1e-6);
+    assert!(matches!(
+        kit.load_airport("ZZZZ"),
+        Err(routekit::RouteKitError::AirportNotFound(_))
+    ));
 }
 
 #[test]
 fn test_parse_simple_route() {
-    if !std::path::Path::new(TEST_DB_PATH).exists() {
-        println!("跳过测试：数据库文件不存在");
-        return;
-    }
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+    let parsed = kit
+        .parse_route("ZGGG ZSPD")
+        .expect("parse airport-only route");
+    assert!(parsed.is_valid, "invalid route: {:?}", parsed.errors);
+    assert_eq!(parsed.departure.as_ref().unwrap().identifier, "ZGGG");
+    assert_eq!(parsed.destination.as_ref().unwrap().identifier, "ZSPD");
+    assert!(
+        parsed.warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        parsed.warnings
+    );
+}
 
-    let kit = RouteKit::new(TEST_DB_PATH).unwrap();
-    
-    // 测试简单的航路解析
-    let route_string = "ZBAA ZSPD";
-    let parsed = kit.parse_route(route_string);
-    
-    if let Ok(result) = parsed {
-        println!("解析结果: 有效={}, 元素数={}", result.is_valid, result.elements.len());
-        println!("警告: {:?}", result.warnings);
-        println!("错误: {:?}", result.errors);
-    }
+fn get_first_airway_segments<'a>(
+    parsed: &'a routekit::ParsedRoute,
+    airway_id: &str,
+) -> &'a [routekit::AirwaySegment] {
+    parsed
+        .elements
+        .iter()
+        .find_map(|e| match e {
+            RouteElement::Airway {
+                identifier,
+                segments,
+            } if identifier == airway_id => Some(segments.as_slice()),
+            _ => None,
+        })
+        .expect("expected airway should be present")
 }
 
 #[test]
-fn test_bearing_calculation() {
-    use routekit::geo::calculate_bearing;
-    
-    let coord1 = Coordinate::new(40.0, 116.0).unwrap();
-    let coord2 = Coordinate::new(31.0, 121.0).unwrap();
-    
-    let bearing = calculate_bearing(&coord1, &coord2);
-    
-    // 航向应该在0-360度之间
-    assert!(bearing >= 0.0 && bearing < 360.0, "航向超出范围: {}", bearing);
-    println!("航向: {:.2}度", bearing);
+fn test_consecutive_waypoints_emit_implicit_dct_segments() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR AND MULOV").expect("parse");
+
+    let direct_count = parsed
+        .elements
+        .iter()
+        .filter(|e| matches!(e, RouteElement::Direct { .. }))
+        .count();
+    assert_eq!(
+        direct_count, 2,
+        "two consecutive hops should emit two DCT segments"
+    );
+
+    let first_is_waypoint = matches!(parsed.elements.first(), Some(RouteElement::Waypoint(wp)) if wp.identifier == "SUPAR");
+    assert!(
+        first_is_waypoint,
+        "first fix should remain a Waypoint element"
+    );
 }
 
 #[test]
-fn test_flight_time_calculation() {
-    use routekit::utils::calculate_flight_time_minutes;
-    
-    let distance_nm = 500.0;
-    let speed_knots = 450.0;
-    
-    let time = calculate_flight_time_minutes(distance_nm, speed_knots);
-    
-    // 500海里 / 450节 * 60分钟 ≈ 66.7分钟
-    assert!((time - 66.67).abs() < 1.0, "飞行时间计算异常: {}", time);
-    println!("预计飞行时间: {:.2} 分钟", time);
+fn test_dct_duplicate_waypoint_prefers_nearest_continuity() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR DCT AND").expect("parse");
+    let direct_to = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Direct { to, .. } => Some(to),
+        _ => None,
+    });
+
+    let to = direct_to.expect("should produce DCT segment");
+    assert_eq!(to.icao_code, "ZS");
+    assert!((to.coordinate.latitude - 30.25666667).abs() < 0.001);
+}
+
+#[test]
+fn test_airway_duplicate_waypoint_prefers_contextual_match() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR B221 AND").expect("parse");
+    let segments = get_first_airway_segments(&parsed, "B221");
+    assert!(!segments.is_empty());
+
+    let last = segments.last().unwrap();
+    assert_eq!(last.waypoint.identifier, "AND");
+    assert_eq!(last.waypoint.icao_code, "ZS");
+    assert!((last.waypoint.coordinate.latitude - 30.25666667).abs() < 0.001);
+}
+
+#[test]
+fn test_airway_reverse_direction_segment_extraction() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR W90 TEPID").expect("parse");
+    let segments = get_first_airway_segments(&parsed, "W90");
+
+    assert_eq!(segments.len(), 3);
+    assert_eq!(segments.first().unwrap().waypoint.identifier, "SUPAR");
+    assert_eq!(segments.last().unwrap().waypoint.identifier, "TEPID");
+}
+
+#[test]
+fn test_unknown_waypoint_kept_as_unknown_token() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR NOTEXIST").expect("parse");
+    let has_unknown = parsed
+        .elements
+        .iter()
+        .any(|e| matches!(e, RouteElement::Unknown(x) if x == "NOTEXIST"));
+    assert!(has_unknown);
+}
+
+#[test]
+fn test_vor_table_is_used_for_waypoint_resolution() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("SUPAR DCT VORPT").expect("parse");
+    let vor = find_resolved_waypoint(&parsed, "VORPT").expect("VOR-only waypoint should resolve");
+    assert_eq!(vor.waypoint_type, routekit::WaypointType::VOR);
+    assert_eq!(vor.icao_code, "ZS");
+}
+
+#[test]
+fn test_ndb_tables_are_used_for_waypoint_resolution() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("ZGGG SID NDBA NDBT ZSPD").expect("parse");
+
+    let ndb_waypoints: Vec<_> = ["NDBA", "NDBT"]
+        .iter()
+        .filter_map(|id| find_resolved_waypoint(&parsed, id))
+        .collect();
+
+    assert_eq!(ndb_waypoints.len(), 2);
+    assert!(ndb_waypoints
+        .iter()
+        .all(|wp| matches!(wp.waypoint_type, routekit::WaypointType::NDB)));
+}
+
+#[test]
+fn test_airway_endpoint_token_is_not_reparsed_as_unknown() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit
+        .parse_route("ZGGG TAN W24 TEPID W90 NOLON A599 ELNEX G204 MULOV V73 SUPAR B221 AND ZSPD")
+        .expect("parse");
+
+    let segments = get_first_airway_segments(&parsed, "B221");
+    assert_eq!(segments.last().unwrap().waypoint.identifier, "AND");
+    assert!(!parsed
+        .elements
+        .iter()
+        .any(|element| matches!(element, RouteElement::Unknown(id) if id == "AND")));
+
+    let has_and_unknown = parsed
+        .warnings
+        .iter()
+        .any(|w| w.contains("无法识别的元素: AND"));
+    assert!(
+        !has_and_unknown,
+        "AND should be consumed by airway endpoint, got warnings: {:?}",
+        parsed.warnings
+    );
+}
+
+#[test]
+fn test_first_token_after_departure_is_not_forced_sid() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("ZYHB HRB NODAL VENOS ZUCK").expect("parse");
+
+    let has_sid = parsed
+        .elements
+        .iter()
+        .any(|e| matches!(e, RouteElement::SID(_)));
+    assert!(!has_sid, "HRB should be parsed as waypoint, not SID");
+
+    let first_wp = parsed.elements.iter().find_map(|e| match e {
+        RouteElement::Waypoint(wp) => Some(wp.identifier.clone()),
+        _ => None,
+    });
+    assert_eq!(first_wp.as_deref(), Some("HRB"));
+}
+
+#[test]
+fn test_duplicate_identifier_prefers_local_continuity_over_far_region() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit
+        .parse_route("ZYHB HRB NODAL CHI VENOS ZUCK")
+        .expect("parse");
+    let chi = find_resolved_waypoint(&parsed, "CHI").expect("CHI should be parsed");
+    assert_eq!(chi.icao_code, "ZY");
+    assert!(
+        chi.coordinate.latitude > 0.0,
+        "should not jump to YB/Channel Island candidate"
+    );
+}
+
+#[test]
+fn test_single_far_candidate_is_skipped_instead_of_forced_match() {
+    let db = setup_parser_db();
+    let kit = RouteKit::new(db.path()).expect("init routekit");
+
+    let parsed = kit.parse_route("ZYHB NEAR1 FARPT ZSPD").expect("parse");
+
+    assert!(
+        find_resolved_waypoint(&parsed, "FARPT").is_none(),
+        "FARPT should not resolve as a waypoint or a direct segment endpoint"
+    );
+
+    let has_unknown_farpt = parsed.elements.iter().any(|e| match e {
+        RouteElement::Unknown(id) => id == "FARPT",
+        _ => false,
+    });
+    assert!(has_unknown_farpt, "FARPT should remain as unknown token");
 }

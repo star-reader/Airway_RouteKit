@@ -35,11 +35,10 @@ libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
-proptest = "1.4"
 tempfile = "3.9"
 
 [[bench]]
-name = "route_search"
+name = "routekit"
 harness = false
 
 [profile.release]

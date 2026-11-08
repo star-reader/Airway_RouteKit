@@ -159,11 +159,22 @@ mod tests {
 
     #[test]
     fn test_pattern_detection() {
-        assert!(is_sid_pattern("TEPID6D"));
-        assert!(is_star_pattern("VGT1A"));
+        // 仅显式关键字能确定程序类别，普通程序名称不能区分 SID 和 STAR。
+        assert!(is_sid_pattern("SID"));
+        assert!(is_sid_pattern("departure"));
+        assert!(!is_sid_pattern("TEPID6D"));
+        assert!(is_star_pattern("STAR"));
+        assert!(is_star_pattern("arrival"));
+        assert!(!is_star_pattern("VGT1A"));
         assert!(is_runway_pattern("36R"));
         assert!(is_runway_pattern("09"));
         assert!(!is_runway_pattern("37R"));
         assert!(!is_runway_pattern("ABC"));
+    }
+
+    #[test]
+    fn test_flight_time_calculation() {
+        let minutes = calculate_flight_time_minutes(500.0, 450.0);
+        assert!((minutes - 66.66666667).abs() < 1e-6);
     }
 }

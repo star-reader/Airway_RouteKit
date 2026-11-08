@@ -163,20 +163,25 @@ mod tests {
 
     #[test]
     fn test_haversine_distance() {
-        // 北京首都国际机场 (ZBAA) 到 上海浦东国际机场 (ZSPD)
+        // 赤道上相差 90° 的两点距离应为四分之一圆周。
+        let origin = Coordinate::new(0.0, 0.0).unwrap();
+        let east = Coordinate::new(0.0, 90.0).unwrap();
+        let expected = EARTH_RADIUS_NM * std::f64::consts::FRAC_PI_2;
+        assert!((haversine_distance_nm(&origin, &east) - expected).abs() < 1e-6);
+        assert!((haversine_distance_nm(&east, &origin) - expected).abs() < 1e-6);
+        assert_eq!(haversine_distance_nm(&origin, &origin), 0.0);
+
+        // 保留非赤道坐标覆盖；球面余弦公式独立计算约为 593.706299 海里。
         let zbaa = Coordinate::new(40.0801, 116.5846).unwrap();
         let zspd = Coordinate::new(31.1434, 121.8052).unwrap();
-        
-        let distance = haversine_distance_nm(&zbaa, &zspd);
-        // 实际距离约为 534 海里
-        assert!((distance - 534.0).abs() < 10.0);
+        assert!((haversine_distance_nm(&zbaa, &zspd) - 593.706299).abs() < 0.001);
     }
 
     #[test]
     fn test_bearing() {
         let coord1 = Coordinate::new(40.0, 116.0).unwrap();
         let coord2 = Coordinate::new(31.0, 121.0).unwrap();
-        
+
         let bearing = calculate_bearing(&coord1, &coord2);
         assert!(bearing >= 0.0 && bearing < 360.0);
     }
@@ -192,7 +197,7 @@ mod tests {
     fn test_midpoint() {
         let coord1 = Coordinate::new(40.0, 116.0).unwrap();
         let coord2 = Coordinate::new(30.0, 120.0).unwrap();
-        
+
         let midpoint = calculate_midpoint(&coord1, &coord2).unwrap();
         assert!((midpoint.latitude - 35.0).abs() < 1.0);
         assert!((midpoint.longitude - 118.0).abs() < 1.0);
@@ -202,9 +207,9 @@ mod tests {
     fn test_bounding_box() {
         let center = Coordinate::new(40.0, 116.0).unwrap();
         let bbox = BoundingBox::from_center_radius(&center, 100.0);
-        
+
         assert!(bbox.contains(&center));
-        
+
         let far_point = Coordinate::new(50.0, 130.0).unwrap();
         assert!(!bbox.contains(&far_point));
     }
