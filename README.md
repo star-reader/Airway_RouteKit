@@ -1,289 +1,147 @@
-# Airway RouteKit - Aviation Route Calculation and Parsing Library
+# Airway RouteKit
 
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-performance aviation route calculation and parsing library developed in Rust, providing core routing functionality for flight planning systems, flight simulation software, and other aviation applications.
+A Rust library for procedure-aware enroute routing and navigation-string parsing, with a C ABI for C++, Go, and other languages. It reads a local navigation database and returns routes, segment details, and optional planning diagnostics.
+
+[**Algorithm and implementation reference**](docs/algorithm-reference.md) — detailed architecture, formulas, search logic, validation, results, and limitations.
 
 ## Features
 
-- **Route Calculation**: Find optimal routes between airports with various preferences
-- **Route Parsing**: Parse and validate aviation route strings in multiple formats
-- **Geographic Calculations**: Accurate great circle distance and bearing calculations
-- **Spatial Search**: Find waypoints and navigation aids within specified areas
-- **High Performance**: Optimized for real-time aviation applications
-- **Comprehensive Database Support**: Works with aviation navigation databases
+- Directed-airway search with altitude constraints, verified SID/STAR boundaries, and route preferences.
+- Contextual parsing of airways, direct legs, ambiguous waypoints, and oceanic coordinates.
+- Great-circle calculations, spatial waypoint queries, and GeoJSON route previews.
+- Optional supplemental paths, regional rules, and route-quality diagnostics.
 
-## Installation
+## Build
 
-### Prerequisites
-
-- Rust 1.70 or higher
-- Aviation navigation database (compatible SQLite format)
-
-### Build from Source
-
-1. Clone the repository:
+Requires a Rust toolchain, a native C compiler, and a compatible SQLite navigation database. Navigation data is not included.
 
 ```bash
 git clone https://github.com/star-reader/Airway_RouteKit.git
 cd Airway_RouteKit
+make build
 ```
 
-2. Build the library:
+Static and shared libraries are generated in `target/release/`.
 
 ```bash
-cargo build --release
+make libs-native     # Stage the native shared library and routekit.h in libs/
+make libs            # Stage macOS and Linux amd64/arm64 shared libraries
+make package         # Create a distribution archive in dist/
 ```
 
-3. The static and dynamic libraries will be available in the `target/release/` directory.
+Linux cross-builds require Zig and the Rust Linux targets. `make setup-cross` installs the pinned cargo-zigbuild tool locally. Use `make help` for available commands.
 
-### Using as a Rust Dependency
+## Rust Usage
 
-Add to your `Cargo.toml`:
+Add the local library to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-airway_routekit = { path = "/path/to/Airway_RouteKit" }
+routekit = { package = "airway_routekit", path = "../Airway_RouteKit" }
 ```
 
-## Quick Start
-
-### Basic Usage
+Search for routes and parse the returned navigation strings:
 
 ```rust
-use routekit::*;
+use routekit::{FlightLevel, RouteKit, RoutePreference, RouteRequest};
 
-fn main() -> Result<()> {
-    // Create RouteKit instance
-    let kit = RouteKit::new("path/to/database.s3db")?;
-
-    // Query routes
+fn main() -> routekit::Result<()> {
+    let kit = RouteKit::new("raw_data/e_navdata.s3db")?;
     let request = RouteRequest {
-        departure_icao: "ZBAA".to_string(),
-        destination_icao: "ZSPD".to_string(),
-        flight_level: Some(FlightLevel::High),
+        departure_icao: "ZBAA".into(),
+        destination_icao: "ZSPD".into(),
+        flight_level: Some(FlightLevel::Custom(350)),
         route_preference: RoutePreference::Balanced,
         max_routes: 3,
     };
 
-    let routes = kit.find_routes(&request)?;
-    for route in routes {
-        println!("Total route distance: {} nautical miles", route.total_distance_nm);
+    for route in kit.find_routes(&request)? {
+        let text = route.to_route_string();
+        println!("{} ({:.1} NM)", text, route.total_distance_nm);
+        let parsed = kit.parse_route(&text)?;
+        println!("Valid: {}; errors: {:?}", parsed.is_valid, parsed.errors);
     }
-
     Ok(())
 }
 ```
 
-### Route Parsing
+`Custom(350)` means FL350; `High` and `Low` select airway categories. Preferences are `Balanced`, `AirwayPreferred`, and `DirectPreferred`. `find_routes_simple()` returns only route strings and distances. A successful parse call can still return `is_valid: false`.
+
+For geographic and spatial queries, using the same `kit`:
 
 ```rust
-use routekit::RouteKit;
-
-let kit = RouteKit::new("database.s3db")?;
-
-// Support multiple formats
-let parsed = kit.parse_route("ZBAA SID TEPID G212 VYK STAR ZSPD")?;
-
-if parsed.is_valid {
-    println!("Departure: {:?}", parsed.departure);
-    println!("Destination: {:?}", parsed.destination);
-    println!("Route elements: {}", parsed.elements.len());
-}
+let from = routekit::Coordinate::new(40.0, 116.0)?;
+let to = routekit::Coordinate::new(31.0, 121.0)?;
+let distance_nm = routekit::geo::haversine_distance_nm(&from, &to);
+let nearest = kit.find_nearest_waypoint(&from);
+let nearby = kit.find_waypoints_within_radius(&from, 50.0);
 ```
 
-### Geographic Calculations
+`find_routes_with_options()` accepts supplemental paths and search options. `find_routes_with_context()` also supports regional rules, quality policies, and capability declarations. See the [basic](examples/basic_usage.rs), [parsing](examples/advanced_parsing.rs), and [advanced](examples/advanced_usage.rs) examples.
 
-```rust
-use routekit::{Coordinate, geo};
+## C++ and Go Usage
 
-let beijing = Coordinate::new(39.9042, 116.4074)?;
-let shanghai = Coordinate::new(31.2304, 121.4737)?;
-
-// Calculate great circle distance
-let distance = geo::haversine_distance_nm(&beijing, &shanghai);
-println!("Distance: {:.2} nautical miles", distance);
-
-// Calculate bearing
-let bearing = geo::calculate_bearing(&beijing, &shanghai);
-println!("Bearing: {:.2}°", bearing);
-```
-
-### Spatial Search
-
-```rust
-let coord = Coordinate::new(40.0, 116.0)?;
-
-// Find nearest waypoint
-if let Some(waypoint) = kit.find_nearest_waypoint(&coord) {
-    println!("Nearest waypoint: {}", waypoint.identifier);
-}
-
-// Find all waypoints within radius
-let nearby = kit.find_waypoints_within_radius(&coord, 50.0);
-println!("Found {} waypoints", nearby.len());
-```
-
-## Usage from Other Languages
-
-### C++ Integration
-
-The library provides C-compatible bindings for C++ integration:
+All C ABI functions are declared in [routekit.h](routekit.h). The basic search returns a JSON array of `route_string` and `total_distance_nm`; the additional search interfaces return full routes and diagnostics.
 
 ```cpp
+#include "routekit.h"
 #include <iostream>
-#include "routekit_c.h"
+#include <memory>
 
 int main() {
-    // Initialize RouteKit
-    RouteKit* kit = routekit_new("database.s3db");
+    using Kit = std::unique_ptr<void, decltype(&routekit_free)>;
+    using Text = std::unique_ptr<char, decltype(&routekit_free_string)>;
+    Kit kit(routekit_new("raw_data/e_navdata.s3db"), routekit_free);
     if (!kit) {
-        std::cerr << "Failed to initialize RouteKit" << std::endl;
+        std::cerr << routekit_last_error() << '\n';
         return 1;
     }
-
-    // Create route request
-    RouteRequest request = {};
-    request.departure_icao = "ZBAA";
-    request.destination_icao = "ZSPD";
-    request.flight_level = FL_HIGH;
-    request.route_preference = ROUTE_BALANCED;
-    request.max_routes = 3;
-
-    // Find routes
-    RouteResponse* response = routekit_find_routes(kit, &request);
-    if (response) {
-        for (int i = 0; i < response->route_count; i++) {
-            std::cout << "Route " << i << ": " 
-                      << response->routes[i].total_distance_nm 
-                      << " NM" << std::endl;
-        }
-        routekit_free_response(response);
+    Text json(routekit_find_routes(kit.get(), "ZBAA", "ZSPD", 1),
+              routekit_free_string);
+    if (!json) {
+        std::cerr << routekit_last_error() << '\n';
+        return 1;
     }
-
-    // Cleanup
-    routekit_destroy(kit);
-    return 0;
+    std::cout << json.get() << '\n';
 }
 ```
 
-Compile with:
-
-```bash
-g++ -o example example.cpp -L./target/release -lroutekit -I./include
-```
-
-### Go Integration
-
-Use cgo to integrate with the Rust library:
+The [Go example](examples/ffi_example.go) provides a cgo wrapper with the same lifecycle:
 
 ```go
-package main
-
-/*
-#cgo LDFLAGS: -L./target/release -lroutekit
-#cgo CFLAGS: -I./include
-#include "routekit_c.h"
-*/
-import "C"
-import (
-    "fmt"
-    "unsafe"
-)
-
-func main() {
-    // Initialize RouteKit
-    dbPath := C.CString("database.s3db")
-    defer C.free(unsafe.Pointer(dbPath))
-  
-    kit := C.routekit_new(dbPath)
-    if kit == nil {
-        fmt.Println("Failed to initialize RouteKit")
-        return
-    }
-    defer C.routekit_destroy(kit)
-
-    // Create route request
-    request := C.RouteRequest{
-        departure_icao:   C.CString("ZBAA"),
-        destination_icao: C.CString("ZSPD"),
-        flight_level:     C.FL_HIGH,
-        route_preference: C.ROUTE_BALANCED,
-        max_routes:       3,
-    }
-    defer C.free(unsafe.Pointer(request.departure_icao))
-    defer C.free(unsafe.Pointer(request.destination_icao))
-
-    // Find routes
-    response := C.routekit_find_routes(kit, &request)
-    if response != nil {
-        defer C.routekit_free_response(response)
-      
-        routes := (*[1 << 28]C.Route)(unsafe.Pointer(response.routes))[:response.route_count:response.route_count]
-        for i, route := range routes {
-            fmt.Printf("Route %d: %.2f NM\n", i, route.total_distance_nm)
-        }
-    }
+kit, err := New("raw_data/e_navdata.s3db")
+if err != nil {
+    return err
 }
+defer kit.Close()
+routes, err := kit.FindRoutes("ZBAA", "ZSPD", 1)
+if err != nil {
+    return err
+}
+fmt.Println(routes)
 ```
 
-Build with:
+Run the complete calling examples from the repository root:
 
 ```bash
-go build -o example example.go
+make example-cpp
+make example-go
 ```
 
-## API Documentation
+Release returned JSON strings with `routekit_free_string()`. On a NULL result, copy `routekit_last_error()` immediately on the same OS thread; that borrowed error string must not be freed. JSON parameters and defaults for the advanced interfaces are described in the header.
 
-### Core Components
+## Notes
 
-- **RouteKit**: Main library interface for route operations
-- **RouteRequest**: Configuration for route queries
-- **RouteResponse**: Contains calculated route information
-- **Coordinate**: Geographic coordinate representation
-- **Waypoint**: Navigation waypoint data structure
+- Supply legally obtained compatible navigation data; database connections are read-only.
+- Route distance covers enroute segments. SID/STAR boundaries guide the search without expanding procedure trajectories.
+- Supplemental paths and regional rules are caller-provided; the library does not fetch live tracks or establish operational authorization.
+- Intended for education and simulation, not real-world flight navigation.
 
-### Route Preferences
-
-- **Direct**: Shortest distance route
-- **Balanced**: Balance between distance and efficiency
-- **Economic**: Fuel-efficient routing
-- **Time**: Time-optimized routing
-
-### Flight Levels
-
-- **Low**: Below FL245
-- **High**: FL245 and above
-- **Custom**: Specific flight level
-
-## Database Requirements
-
-This library requires an aviation navigation database to function properly. The database should include:
-
-- Airport information (ICAO/IATA codes, coordinates, runways)
-- Waypoints and navigation aids
-- Airway structures and connections
-- Standard Instrument Departures (SIDs)
-- Standard Terminal Arrival Routes (STARs)
-
-**Note**: Ensure you have proper licensing and legal access to aviation navigation databases.
-
-## Performance
-
-- Optimized for real-time route calculations
-- Efficient spatial indexing for waypoint searches
-- Minimal memory footprint
-- Thread-safe operations
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+API reference: `cargo doc --no-deps`. Issues and pull requests are welcome.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Disclaimer
-
-This library is intended for educational and simulation purposes. **It can't use in real flight!**  For aviation applications, ensure compliance with relevant aviation authorities and regulations.
+[MIT](LICENSE).

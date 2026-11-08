@@ -1,60 +1,68 @@
 use crate::database::DatabasePool;
-use crate::error::Result;
-use crate::geo::{bearing_turn_angle, calculate_bearing, haversine_distance_nm};
+use crate::error::{Result, RouteKitError};
+use crate::geo::haversine_distance_nm;
 use crate::models::*;
-use crate::utils::*;
-use lazy_static::lazy_static;
-use regex::Regex;
+use crate::utils::{is_runway_pattern, split_route_string, validate_icao};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-lazy_static! {
-    /// ICAO代码模式
-    static ref ICAO_PATTERN: Regex = Regex::new(r"^[A-Z]{4}$").unwrap();
-    
-    /// 航路模式（如：A593, G212, J146）
-    static ref AIRWAY_PATTERN: Regex = Regex::new(r"^[A-Z]\d+$").unwrap();
-    
-    /// SID模式（通常以数字结尾，包含字母）
-    static ref SID_PATTERN: Regex = Regex::new(r"^[A-Z0-9]+\d[A-Z]?$").unwrap();
-    
-    /// STAR模式
-    static ref STAR_PATTERN: Regex = Regex::new(r"^[A-Z0-9]+\d[A-Z]?$").unwrap();
-    
-    /// 跑道模式
-    static ref RUNWAY_PATTERN: Regex = Regex::new(r"^([0-2]\d|3[0-6])[LCR]?$").unwrap();
-}
-
-/// 航路解析器
 pub struct RouteParser {
     db_pool: Arc<DatabasePool>,
 }
 
-impl RouteParser {
-    /// 相邻航点间允许的最大跳变距离（海里）
-    const MAX_WAYPOINT_HOP_NM: f64 = 500.0;
-    /// 直飞（DCT）航段允许的最大跳变距离（海里），用于跨洋长直飞
-    const MAX_DCT_HOP_NM: f64 = 2500.0;
-    /// 起点后第一个航点允许的最大距离
-    const MAX_FIRST_FIX_FROM_DEP_NM: f64 = 400.0;
-    /// 拒绝引入过大转弯的角度阈值（度）
-    const MAX_TURN_ANGLE_DEG: f64 = 135.0;
-    /// 候选点相对“朝目的地”方向的最大偏离角（度）
-    const MAX_OFF_DESTINATION_BEARING_DEG: f64 = 110.0;
-    /// 在较大距离下才启用目的地方向校验的距离阈值（海里）
-    const OFF_DESTINATION_CHECK_MIN_NM: f64 = 150.0;
-    /// 允许长直飞时，相邻航段转弯角上限（度）
-    const GOOD_CONTINUITY_TURN_DEG: f64 = 45.0;
-    /// 允许长直飞时，相对目的地方向偏离角上限（度）
-    const GOOD_CONTINUITY_OFF_COURSE_DEG: f64 = 45.0;
+struct State {
+    last: Option<Waypoint>,
+    score: f64,
+    errors: usize,
+    parent: Option<usize>,
+    element: Option<RouteElement>,
+    message: Option<String>,
+}
 
+fn key(point: &Option<Waypoint>) -> String {
+    point
+        .as_ref()
+        .map(|p| {
+            format!(
+                "{}|{}|{:?}|{:?}|{:.7}|{:.7}",
+                p.identifier,
+                p.icao_code,
+                p.waypoint_type,
+                p.id,
+                p.coordinate.latitude,
+                p.coordinate.longitude
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn add_state(
+    arena: &mut Vec<State>,
+    positions: &mut [HashMap<String, usize>],
+    pos: usize,
+    state: State,
+) {
+    let identity = key(&state.last);
+    if let Some(&old) = positions[pos].get(&identity) {
+        if arena[old].errors < state.errors
+            || (arena[old].errors == state.errors && arena[old].score <= state.score)
+        {
+            return;
+        }
+    }
+    let id = arena.len();
+    arena.push(state);
+    positions[pos].insert(identity, id);
+}
+
+impl RouteParser {
     pub fn new(db_pool: Arc<DatabasePool>) -> Self {
         Self { db_pool }
     }
 
-    /// 解析航路字符串
     pub fn parse(&self, route_string: &str) -> Result<ParsedRoute> {
         let mut parsed = ParsedRoute {
-            raw_input: route_string.to_string(),
+            raw_input: route_string.into(),
             departure: None,
             destination: None,
             sid: None,
@@ -64,785 +72,291 @@ impl RouteParser {
             errors: Vec::new(),
             is_valid: false,
         };
-
-        // 预处理：标准化输入
-        let normalized = self.normalize_input(route_string);
-        let tokens = split_route_string(&normalized);
-
+        let normalized = route_string
+            .to_uppercase()
+            .replace(['(', ')', '"', '\'', '[', ']', '{', '}', '，', '。'], " ")
+            .replace("..", " ");
+        let mut tokens = split_route_string(&normalized);
+        tokens.retain(|t| !matches!(t.as_str(), "VIA" | "TO" | "FROM" | "AT" | "THE"));
         if tokens.is_empty() {
-            parsed.errors.push("输入为空".to_string());
+            parsed.errors.push("输入为空".into());
             return Ok(parsed);
         }
-
-        // 解析各个部分
-        let destination_hint = tokens
-            .iter()
-            .rev()
-            .find(|token| self.is_airport_code(&token.to_uppercase()))
-            .and_then(|icao| self.db_pool.load_airport(&icao.to_uppercase()).ok());
-        let destination_region_hint = destination_hint
-            .as_ref()
-            .and_then(|ap| Self::airport_region_code(&ap.identifier));
-
-        self.parse_tokens(
-            &tokens,
-            &mut parsed,
-            destination_hint.as_ref(),
-            destination_region_hint.as_deref(),
-        )?;
-
-        // 验证解析结果
-        parsed.is_valid = parsed.errors.is_empty() 
-            && parsed.departure.is_some() 
-            && parsed.destination.is_some();
-
-        Ok(parsed)
-    }
-
-    /// 标准化输入
-    fn normalize_input(&self, input: &str) -> String {
-        let mut normalized = input.to_uppercase();
-
-        // 移除常见的无关字符
-        normalized = normalized.replace(['(', ')', '"', '\'', '[', ']', '{', '}'], " ");
-        
-        // 标准化分隔符
-        normalized = normalized.replace("->", " ");
-        normalized = normalized.replace("→", " ");
-        normalized = normalized.replace("..", " ");
-        
-        // 处理中文标点
-        normalized = normalized.replace("，", " ");
-        normalized = normalized.replace("。", " ");
-        
-        normalize_spaces(&normalized)
-    }
-
-    /// 解析令牌序列
-    fn parse_tokens(
-        &self,
-        tokens: &[String],
-        parsed: &mut ParsedRoute,
-        destination_hint: Option<&Airport>,
-        destination_region_hint: Option<&str>,
-    ) -> Result<()> {
-        let mut i = 0;
-        let mut second_last_waypoint: Option<Waypoint> = None;
-        let mut last_waypoint: Option<Waypoint> = None;
-        let mut expecting_destination = false;
-        let mut departure_region: Option<String> = None;
-        let mut destination_region: Option<String> =
-            destination_region_hint.map(|region| region.to_string());
-
-        while i < tokens.len() {
-            let token = &tokens[i];
-            let token_upper = token.to_uppercase();
-
-            // 跳过无意义的词
-            if matches!(
-                token_upper.as_str(),
-                "VIA" | "TO" | "FROM" | "AT" | "FL" | "THE"
-            ) {
-                i += 1;
-                continue;
+        if tokens.len() > 512 {
+            return Err(RouteKitError::ParseError("Route exceeds 512 tokens".into()));
+        }
+        if validate_icao(&tokens[0]) {
+            parsed.departure = self.db_pool.load_airport(&tokens[0]).ok();
+        }
+        if parsed.departure.is_some() {
+            tokens.remove(0);
+        }
+        if let Some(last) = tokens.last().filter(|s| validate_icao(s)) {
+            parsed.destination = self.db_pool.load_airport(last).ok();
+        }
+        if parsed.destination.is_some() {
+            tokens.pop();
+        }
+        tokens.retain(|t| {
+            if is_runway_pattern(t) {
+                parsed.warnings.push(format!("Runway not formatted: {t}"));
+                false
+            } else {
+                true
             }
-
-            // 解析起飞机场（第一个ICAO代码）
-            if parsed.departure.is_none() && self.is_airport_code(&token_upper) {
-                match self.db_pool.load_airport(&token_upper) {
-                    Ok(airport) => {
-                        departure_region = Self::airport_region_code(&airport.identifier);
-                        parsed.departure = Some(airport);
-                    }
-                    Err(_) => {
-                        parsed.warnings.push(format!("机场 {} 未在数据库中找到", token_upper));
-                    }
-                }
-                i += 1;
-                continue;
-            }
-
-            // 处理跑道标识符
-            if is_runway_pattern(&token_upper) {
-                // 跑道信息通常跟在机场后面
-                parsed.warnings.push(format!("忽略跑道标识符: {}", token_upper));
-                i += 1;
-                continue;
-            }
-
-            // 处理SID（仅当明确包含SID关键字时）
-            if token_upper.contains("SID") {
-                if let Some(sid_name) = self.extract_procedure_name(&token_upper, "SID") {
-                    parsed.sid = Some(sid_name.clone());
-                    parsed.elements.push(RouteElement::SID(sid_name));
-                }
-                i += 1;
-                continue;
-            }
-
-            // 处理STAR
-            if token_upper.contains("STAR") {
-                if let Some(star_name) = self.extract_procedure_name(&token_upper, "STAR") {
-                    parsed.star = Some(star_name.clone());
-                    parsed.elements.push(RouteElement::STAR(star_name));
-                    expecting_destination = true;
-                }
-                i += 1;
-                continue;
-            }
-
-            // 处理DCT（直飞）
-            if token_upper == "DCT" {
-                if let Some(from_wp) = last_waypoint.clone() {
-                    // 下一个应该是航点
-                    if i + 1 < tokens.len() {
-                        i += 1;
-                        if let Some(to_wp) = self.pick_waypoint_candidate(
-                            &tokens[i],
-                            &last_waypoint,
-                            &second_last_waypoint,
-                            parsed.departure.as_ref(),
-                            destination_hint,
-                            departure_region.as_deref(),
-                            destination_region.as_deref(),
-                        )? {
-                            parsed.elements.push(RouteElement::Direct {
-                                from: from_wp.clone(),
-                                to: to_wp.clone(),
-                            });
-                            second_last_waypoint = last_waypoint;
-                            last_waypoint = Some(to_wp);
-                        }
-                    }
-                }
-                i += 1;
-                continue;
-            }
-
-            // 处理航路
-            if AIRWAY_PATTERN.is_match(&token_upper) {
-                // 获取前一个航点名称
-                let from_waypoint_id = last_waypoint.as_ref().map(|wp| wp.identifier.clone());
-                
-                // 获取下一个航点名称（如果有的话）
-                let to_waypoint_id = if i + 1 < tokens.len() {
-                    let next_token = &tokens[i + 1].to_uppercase();
-                    // 下一个token可能是航点或机场
-                    if !AIRWAY_PATTERN.is_match(next_token) 
-                        && !matches!(next_token.as_str(), "VIA" | "TO" | "FROM" | "AT" | "FL" | "THE" | "DCT" | "SID" | "STAR") 
-                    {
-                        Some(next_token.clone())
-                    } else {
-                        None
-                    }
+        });
+        let graph = self.db_pool.network()?;
+        let mut candidates = Vec::with_capacity(tokens.len());
+        let mut annotations = Vec::with_capacity(tokens.len());
+        for token in &tokens {
+            let points = if token == "DCT" || token == "SID" || token == "STAR" {
+                Vec::new()
+            } else if let Some(point) = crate::oceanic::coordinate_waypoint(token) {
+                vec![point]
+            } else {
+                self.db_pool.find_waypoints(token)?
+            };
+            let annotation = if token == "SID" {
+                Some(RouteElement::SID(token.clone()))
+            } else if token == "STAR" {
+                Some(RouteElement::STAR(token.clone()))
+            } else if points.is_empty() && !graph.airway_rows.contains_key(token) {
+                if parsed.departure.as_ref().is_some_and(|a| {
+                    self.db_pool
+                        .procedure_exists(&a.identifier, token, true)
+                        .unwrap_or(false)
+                }) {
+                    Some(RouteElement::SID(token.clone()))
+                } else if parsed.destination.as_ref().is_some_and(|a| {
+                    self.db_pool
+                        .procedure_exists(&a.identifier, token, false)
+                        .unwrap_or(false)
+                }) {
+                    Some(RouteElement::STAR(token.clone()))
                 } else {
                     None
-                };
-                
-                let mut consumed_to_waypoint_token = false;
-                // 获取航路的所有航段
-                if let Ok(all_segments) = self.db_pool.find_airway_segments(&token_upper) {
-                    if !all_segments.is_empty() {
-                        let to_waypoint_hint = to_waypoint_id
-                            .as_deref()
-                            .and_then(|id| {
-                                self.pick_waypoint_candidate(
-                                    id,
-                                    &last_waypoint,
-                                    &second_last_waypoint,
-                                    parsed.departure.as_ref(),
-                                    destination_hint,
-                                    departure_region.as_deref(),
-                                    destination_region.as_deref(),
-                                )
-                                .ok()
+                }
+            } else {
+                None
+            };
+            candidates.push(points);
+            annotations.push(annotation);
+        }
+        let mut arena = vec![State {
+            last: None,
+            score: 0.0,
+            errors: 0,
+            parent: None,
+            element: None,
+            message: None,
+        }];
+        let mut positions: Vec<HashMap<String, usize>> =
+            (0..=tokens.len()).map(|_| HashMap::new()).collect();
+        positions[0].insert(String::new(), 0);
+        for i in 0..tokens.len() {
+            let mut current: Vec<_> = positions[i].values().copied().collect();
+            current.sort_unstable();
+            for at in current {
+                let last = arena[at].last.clone();
+                let score = arena[at].score;
+                let errors = arena[at].errors;
+                let token = &tokens[i];
+                if let Some(element) = annotations[i].clone() {
+                    add_state(
+                        &mut arena,
+                        &mut positions,
+                        i + 1,
+                        State {
+                            last,
+                            score,
+                            errors,
+                            parent: Some(at),
+                            element: Some(element),
+                            message: None,
+                        },
+                    );
+                    continue;
+                }
+                for point in &candidates[i] {
+                    let distance =
+                        last.as_ref()
+                            .map(|p| haversine_distance_nm(&p.coordinate, &point.coordinate))
+                            .or_else(|| {
+                                parsed.departure.as_ref().map(|a| {
+                                    haversine_distance_nm(&a.coordinate, &point.coordinate)
+                                })
                             })
-                            .flatten();
-
-                        // 截取从 from_waypoint 到 to_waypoint 之间的航段
-                        let filtered_segments = self.extract_airway_segment(
-                            &all_segments,
-                            last_waypoint.as_ref(),
-                            to_waypoint_id.as_deref(),
-                            to_waypoint_hint.as_ref(),
-                            departure_region.as_deref(),
-                            destination_region.as_deref(),
-                        );
-                        
-                        if !filtered_segments.is_empty() {
-                            parsed.elements.push(RouteElement::Airway {
-                                identifier: token_upper.clone(),
-                                segments: filtered_segments.clone(),
-                            });
-                            if let Some(last_seg) = filtered_segments.last() {
-                                second_last_waypoint = last_waypoint;
-                                last_waypoint = Some(last_seg.waypoint.clone());
-                            }
-                            if let (Some(to_id), Some(last_seg)) =
-                                (to_waypoint_id.as_deref(), filtered_segments.last())
-                            {
-                                // 航路已明确到达下一个航点token，避免后续重复解析并产生Unknown警告
-                                if last_seg.waypoint.identifier.eq_ignore_ascii_case(to_id) {
-                                    consumed_to_waypoint_token = true;
+                            .unwrap_or(0.0);
+                    // Sanity limits for unqualified hops, not authorization limits on explicit DCT.
+                    if distance > 3000.0
+                        || (last.is_none() && parsed.departure.is_some() && distance > 1000.0)
+                    {
+                        continue;
+                    }
+                    let element = match &last {
+                        Some(from) => RouteElement::Direct {
+                            from: from.clone(),
+                            to: point.clone(),
+                        },
+                        None => RouteElement::Waypoint(point.clone()),
+                    };
+                    add_state(
+                        &mut arena,
+                        &mut positions,
+                        i + 1,
+                        State {
+                            last: Some(point.clone()),
+                            score: score + distance,
+                            errors,
+                            parent: Some(at),
+                            element: Some(element),
+                            message: None,
+                        },
+                    );
+                }
+                if let Some(from) = &last {
+                    if i + 1 < tokens.len() {
+                        for to in &candidates[i + 1] {
+                            if token == "DCT" {
+                                let distance =
+                                    haversine_distance_nm(&from.coordinate, &to.coordinate);
+                                add_state(
+                                    &mut arena,
+                                    &mut positions,
+                                    i + 2,
+                                    State {
+                                        last: Some(to.clone()),
+                                        score: score + distance,
+                                        errors,
+                                        parent: Some(at),
+                                        element: Some(RouteElement::Direct {
+                                            from: from.clone(),
+                                            to: to.clone(),
+                                        }),
+                                        message: None,
+                                    },
+                                );
+                            } else if graph.airway_rows.contains_key(token) {
+                                for path in graph.expand(token, from, to) {
+                                    let distance: f64 = path
+                                        .windows(2)
+                                        .map(|p| {
+                                            haversine_distance_nm(
+                                                &p[0].waypoint.coordinate,
+                                                &p[1].waypoint.coordinate,
+                                            )
+                                        })
+                                        .sum();
+                                    let last = path.last().unwrap().waypoint.clone();
+                                    add_state(
+                                        &mut arena,
+                                        &mut positions,
+                                        i + 2,
+                                        State {
+                                            last: Some(last),
+                                            score: score + distance,
+                                            errors,
+                                            parent: Some(at),
+                                            element: Some(RouteElement::Airway {
+                                                identifier: token.clone(),
+                                                segments: path,
+                                            }),
+                                            message: None,
+                                        },
+                                    );
                                 }
                             }
-                        } else {
-                            parsed.warnings.push(format!(
-                                "航路 {} 中未找到从 {:?} 到 {:?} 的航段", 
-                                token_upper, from_waypoint_id, to_waypoint_id
-                            ));
                         }
-                    } else {
-                        parsed.warnings.push(format!("航路 {} 未找到航段", token_upper));
                     }
+                }
+                let message = if token == "DCT" {
+                    "DCT 缺少明确的起点或终点".to_owned()
+                } else if graph.airway_rows.contains_key(token) {
+                    format!("航路 {token} 的端点、连续性或方向不成立")
                 } else {
-                    parsed.warnings.push(format!("航路 {} 未在数据库中找到", token_upper));
-                }
-                if consumed_to_waypoint_token && i + 1 < tokens.len() {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-
-            // 处理航点（相邻航点之间无航路时，等价于 DCT）
-            if let Some(waypoint) = self.pick_waypoint_candidate(
-                &token_upper,
-                &last_waypoint,
-                &second_last_waypoint,
-                parsed.departure.as_ref(),
-                destination_hint,
-                departure_region.as_deref(),
-                destination_region.as_deref(),
-            )? {
-                if let Some(from_wp) = last_waypoint.clone() {
-                    parsed.elements.push(RouteElement::Direct {
-                        from: from_wp,
-                        to: waypoint.clone(),
-                    });
-                } else {
-                    parsed.elements.push(RouteElement::Waypoint(waypoint.clone()));
-                }
-                second_last_waypoint = last_waypoint;
-                last_waypoint = Some(waypoint);
-                i += 1;
-                continue;
-            }
-
-            // 最后尝试作为目的机场
-            if self.is_airport_code(&token_upper) && (expecting_destination || i == tokens.len() - 1) {
-                match self.db_pool.load_airport(&token_upper) {
-                    Ok(airport) => {
-                        destination_region = Self::airport_region_code(&airport.identifier);
-                        parsed.destination = Some(airport);
-                    }
-                    Err(_) => {
-                        parsed.warnings.push(format!("目的机场 {} 未找到", token_upper));
-                    }
-                }
-                i += 1;
-                continue;
-            }
-
-            // 无法识别的元素
-            parsed.elements.push(RouteElement::Unknown(token_upper.clone()));
-            parsed.warnings.push(format!("无法识别的元素: {}", token_upper));
-            i += 1;
-        }
-
-        // 如果没有明确的目的机场，尝试从最后的ICAO代码推断
-        if parsed.destination.is_none() && !tokens.is_empty() {
-            let last_token = &tokens[tokens.len() - 1];
-            if self.is_airport_code(last_token) {
-                if let Ok(airport) = self.db_pool.load_airport(last_token) {
-                    parsed.destination = Some(airport);
+                    format!("无法识别或无法连续解析的元素: {token}")
+                };
+                // An unresolved token explicitly breaks continuity. No Direct is bridged over it.
+                add_state(
+                    &mut arena,
+                    &mut positions,
+                    i + 1,
+                    State {
+                        last: None,
+                        score,
+                        errors: errors + 1,
+                        parent: Some(at),
+                        element: Some(RouteElement::Unknown(token.clone())),
+                        message: Some(message),
+                    },
+                );
+                if arena.len() > 100_000 {
+                    return Err(RouteKitError::ParseError(
+                        "Ambiguous route exceeds parser state budget".into(),
+                    ));
                 }
             }
         }
-
-        Ok(())
-    }
-
-    /// 判断是否是机场代码
-    fn is_airport_code(&self, token: &str) -> bool {
-        validate_icao(token)
-    }
-
-    /// 尝试查找航点
-    fn try_find_waypoint(&self, identifier: &str) -> Result<Option<Waypoint>> {
-        self.db_pool.find_waypoint(identifier)
-    }
-
-    fn pick_waypoint_candidate(
-        &self,
-        identifier: &str,
-        prev_waypoint: &Option<Waypoint>,
-        second_last_waypoint: &Option<Waypoint>,
-        departure_airport: Option<&Airport>,
-        destination_hint: Option<&Airport>,
-        departure_region: Option<&str>,
-        destination_region: Option<&str>,
-    ) -> Result<Option<Waypoint>> {
-        let candidates = self.db_pool.find_waypoints(identifier)?;
-        Ok(self.select_best_waypoint(
-            candidates,
-            prev_waypoint.as_ref(),
-            second_last_waypoint.as_ref(),
-            departure_airport,
-            destination_hint,
-            departure_region,
-            destination_region,
-        ))
-    }
-
-    fn airport_region_code(icao: &str) -> Option<String> {
-        if icao.len() >= 2 {
-            Some(icao[..2].to_string())
-        } else {
-            None
+        let final_score = |s: &State| {
+            s.score
+                + s.last
+                    .as_ref()
+                    .zip(parsed.destination.as_ref())
+                    .map(|(p, a)| haversine_distance_nm(&p.coordinate, &a.coordinate))
+                    .unwrap_or(0.0)
+        };
+        let best = positions[tokens.len()]
+            .values()
+            .copied()
+            .min_by(|&a, &b| {
+                arena[a]
+                    .errors
+                    .cmp(&arena[b].errors)
+                    .then_with(|| final_score(&arena[a]).total_cmp(&final_score(&arena[b])))
+                    .then(a.cmp(&b))
+            })
+            .unwrap_or(0);
+        let mut at = best;
+        loop {
+            if let Some(element) = arena[at].element.clone() {
+                parsed.elements.push(element);
+            }
+            if let Some(message) = &arena[at].message {
+                parsed.errors.push(message.clone());
+            }
+            match arena[at].parent {
+                Some(parent) => at = parent,
+                None => break,
+            }
         }
-    }
-
-    fn select_best_waypoint(
-        &self,
-        candidates: Vec<Waypoint>,
-        prev_waypoint: Option<&Waypoint>,
-        second_last_waypoint: Option<&Waypoint>,
-        departure_airport: Option<&Airport>,
-        destination_hint: Option<&Airport>,
-        departure_region: Option<&str>,
-        destination_region: Option<&str>,
-    ) -> Option<Waypoint> {
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let anchor_coord = prev_waypoint
-            .map(|wp| wp.coordinate)
-            .or_else(|| departure_airport.map(|ap| ap.coordinate));
-        let anchor_region = prev_waypoint
-            .map(|wp| wp.icao_code.as_str())
-            .or(departure_region);
-
-        let mut best: Option<(f64, f64, Waypoint)> = None;
-
-        for candidate in candidates {
-            let mut score = 0.0;
-            let mut dist_to_anchor = f64::MAX;
-
-            if let Some(anchor) = anchor_coord {
-                let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
-                dist_to_anchor = dist;
-                score += dist.min(6000.0);
-
-                if let Some(region) = anchor_region {
-                    if !candidate.icao_code.is_empty() && candidate.icao_code == region {
-                        score -= 300.0;
-                    }
-                }
-
-                if dist > Self::MAX_WAYPOINT_HOP_NM {
-                    let same_region = anchor_region
-                        .map(|r| !candidate.icao_code.is_empty() && candidate.icao_code == r)
-                        .unwrap_or(false);
-                    if !same_region {
-                        score += 20000.0;
-                    }
-                }
-            }
-
-            if let Some(dest_region) = destination_region {
-                if !candidate.icao_code.is_empty() && candidate.icao_code == dest_region {
-                    score -= 180.0;
-                }
-            }
-
-            if let Some(dep_region) = departure_region {
-                if !candidate.icao_code.is_empty() && candidate.icao_code == dep_region {
-                    score -= 160.0;
-                }
-            }
-
-            if !matches!(candidate.waypoint_type, WaypointType::Enroute) {
-                score += 75.0;
-            }
-
-            match &mut best {
-                Some((best_score, best_dist, best_wp)) if score < *best_score
-                    || ((score - *best_score).abs() < 1e-6 && dist_to_anchor < *best_dist) =>
-                {
-                    *best_score = score;
-                    *best_dist = dist_to_anchor;
-                    *best_wp = candidate;
-                }
-                None => best = Some((score, dist_to_anchor, candidate)),
+        parsed.elements.reverse();
+        parsed.errors.reverse();
+        for element in &parsed.elements {
+            match element {
+                RouteElement::SID(id) => parsed.sid = Some(id.clone()),
+                RouteElement::STAR(id) => parsed.star = Some(id.clone()),
                 _ => {}
             }
         }
-
-        let (.., selected) = best?;
-
-        if !self.is_waypoint_acceptable(
-            &selected,
-            prev_waypoint,
-            second_last_waypoint,
-            departure_airport,
-            destination_hint,
-            departure_region,
-        ) {
-            return None;
-        }
-
-        Some(selected)
-    }
-
-    fn is_waypoint_acceptable(
-        &self,
-        candidate: &Waypoint,
-        prev_waypoint: Option<&Waypoint>,
-        second_last_waypoint: Option<&Waypoint>,
-        departure_airport: Option<&Airport>,
-        destination_hint: Option<&Airport>,
-        departure_region: Option<&str>,
-    ) -> bool {
-        let anchor_coord = prev_waypoint
-            .map(|wp| wp.coordinate)
-            .or_else(|| departure_airport.map(|ap| ap.coordinate));
-        let anchor_region = prev_waypoint
-            .map(|wp| wp.icao_code.as_str())
-            .or(departure_region);
-
-        let Some(anchor) = anchor_coord else {
-            return true;
-        };
-
-        let dist = haversine_distance_nm(&anchor, &candidate.coordinate);
-        let same_region = anchor_region
-            .map(|r| !candidate.icao_code.is_empty() && candidate.icao_code == r)
-            .unwrap_or(false);
-
-        if prev_waypoint.is_none() {
-            if let Some(_dep) = departure_airport {
-                if dist > Self::MAX_FIRST_FIX_FROM_DEP_NM && !same_region {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        if dist > Self::MAX_WAYPOINT_HOP_NM && !same_region {
-            if dist > Self::MAX_DCT_HOP_NM
-                || !self.has_good_dct_continuity(
-                    candidate,
-                    prev_waypoint,
-                    second_last_waypoint,
-                    destination_hint,
-                )
-            {
-                return false;
-            }
-        }
-
-        if let (Some(prev), Some(second_last)) = (prev_waypoint, second_last_waypoint) {
-            let inbound = calculate_bearing(&second_last.coordinate, &prev.coordinate);
-            let outbound = calculate_bearing(&prev.coordinate, &candidate.coordinate);
-            let turn = bearing_turn_angle(inbound, outbound);
-            if turn > Self::MAX_TURN_ANGLE_DEG && dist > Self::OFF_DESTINATION_CHECK_MIN_NM {
-                return false;
-            }
-        }
-
-        if let (Some(prev), Some(dest)) = (prev_waypoint, destination_hint) {
-            if dist > Self::OFF_DESTINATION_CHECK_MIN_NM {
-                let toward_dest = calculate_bearing(&prev.coordinate, &dest.coordinate);
-                let toward_candidate =
-                    calculate_bearing(&prev.coordinate, &candidate.coordinate);
-                let off_course = bearing_turn_angle(toward_dest, toward_candidate);
-                if off_course > Self::MAX_OFF_DESTINATION_BEARING_DEG && !same_region {
-                    return false;
-                }
-            }
-        }
-
-        true
-    }
-
-    /// 判断长直飞航段是否具备良好地理连续性（小转弯或朝向目的地）
-    fn has_good_dct_continuity(
-        &self,
-        candidate: &Waypoint,
-        prev_waypoint: Option<&Waypoint>,
-        second_last_waypoint: Option<&Waypoint>,
-        destination_hint: Option<&Airport>,
-    ) -> bool {
-        let Some(prev) = prev_waypoint else {
-            return true;
-        };
-
-        if let Some(second_last) = second_last_waypoint {
-            let inbound = calculate_bearing(&second_last.coordinate, &prev.coordinate);
-            let outbound = calculate_bearing(&prev.coordinate, &candidate.coordinate);
-            if bearing_turn_angle(inbound, outbound) <= Self::GOOD_CONTINUITY_TURN_DEG {
-                return true;
-            }
-        }
-
-        if let Some(dest) = destination_hint {
-            let toward_dest = calculate_bearing(&prev.coordinate, &dest.coordinate);
-            let toward_candidate =
-                calculate_bearing(&prev.coordinate, &candidate.coordinate);
-            if bearing_turn_angle(toward_dest, toward_candidate)
-                <= Self::GOOD_CONTINUITY_OFF_COURSE_DEG
-            {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    /// 提取程序名称
-    fn extract_procedure_name(&self, token: &str, proc_type: &str) -> Option<String> {
-        // 移除 "SID" 或 "STAR" 后缀
-        let name = token.replace(proc_type, "").trim().to_string();
-        if !name.is_empty() {
-            Some(name)
-        } else {
-            Some(token.to_string())
-        }
-    }
-
-    /// 从完整航路中提取指定起止航点之间的航段
-    /// 
-    /// segments 已经按照 seqno 排序（可能正向或反向飞行）
-    /// from_waypoint: 起始航点名称（可选）
-    /// to_waypoint: 结束航点名称（可选）
-    fn extract_airway_segment(
-        &self,
-        segments: &[AirwaySegment],
-        from_waypoint: Option<&Waypoint>,
-        to_waypoint: Option<&str>,
-        to_waypoint_hint: Option<&Waypoint>,
-        departure_region: Option<&str>,
-        destination_region: Option<&str>,
-    ) -> Vec<AirwaySegment> {
-        if segments.is_empty() {
-            return vec![];
-        }
-
-        // 找出 from_waypoint 和 to_waypoint 在航路中的位置（索引）
-        let from_idx = from_waypoint.and_then(|from| {
-            self.select_best_segment_index(
-                segments,
-                &from.identifier,
-                Some(from),
-                departure_region,
-                destination_region,
-            )
-        });
-
-        let to_idx = to_waypoint.and_then(|to| {
-            self.select_best_segment_index(
-                segments,
-                to,
-                to_waypoint_hint,
-                departure_region,
-                destination_region,
-            )
-        });
-
-        match (from_idx, to_idx) {
-            // 两个航点都找到了
-            (Some(from), Some(to)) => {
-                if from <= to {
-                    // 正向飞行
-                    segments[from..=to].to_vec()
-                } else {
-                    // 反向飞行
-                    segments[to..=from].iter().rev().cloned().collect()
-                }
-            }
-            // 只找到起始航点
-            (Some(from), None) => {
-                segments[from..].to_vec()
-            }
-            // 只找到结束航点
-            (None, Some(to)) => {
-                segments[..=to].to_vec()
-            }
-            // 都没找到，返回全部
-            (None, None) => {
-                segments.to_vec()
-            }
-        }
-    }
-
-    fn select_best_segment_index(
-        &self,
-        segments: &[AirwaySegment],
-        identifier: &str,
-        waypoint_hint: Option<&Waypoint>,
-        departure_region: Option<&str>,
-        destination_region: Option<&str>,
-    ) -> Option<usize> {
-        let mut matches: Vec<usize> = segments
+        if parsed
+            .elements
             .iter()
-            .enumerate()
-            .filter_map(|(idx, seg)| {
-                if seg.waypoint.identifier.eq_ignore_ascii_case(identifier) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if matches.is_empty() {
-            return None;
+            .any(|e| matches!(e, RouteElement::Direct { .. }))
+        {
+            parsed
+                .warnings
+                .push("DCT 已按输入解析；未验证区域、时间和运行许可".into());
         }
-        if matches.len() == 1 {
-            return matches.pop();
+        if parsed.sid.is_some() || parsed.star.is_some() {
+            parsed.warnings.push("SID/STAR not formatted".into());
         }
-
-        let mut best: Option<(f64, f64, usize)> = None;
-        for idx in matches {
-            let seg_wp = &segments[idx].waypoint;
-            let mut score = 0.0;
-            let mut dist_to_hint = f64::MAX;
-
-            if let Some(hint) = waypoint_hint {
-                let dist = haversine_distance_nm(&hint.coordinate, &seg_wp.coordinate);
-                dist_to_hint = dist;
-                score += dist.min(6000.0);
-                if !hint.icao_code.is_empty() && hint.icao_code == seg_wp.icao_code {
-                    score -= 250.0;
-                }
-
-                let same_region =
-                    !hint.icao_code.is_empty() && hint.icao_code == seg_wp.icao_code;
-                if dist > Self::MAX_WAYPOINT_HOP_NM && !same_region {
-                    continue;
-                }
-            }
-
-            if let Some(dest_region) = destination_region {
-                if !seg_wp.icao_code.is_empty() && seg_wp.icao_code == dest_region {
-                    score -= 180.0;
-                }
-            }
-
-            if let Some(dep_region) = departure_region {
-                if !seg_wp.icao_code.is_empty() && seg_wp.icao_code == dep_region {
-                    score -= 120.0;
-                }
-            }
-
-            match best {
-                Some((best_score, best_dist, _)) if score > best_score
-                    || ((score - best_score).abs() < 1e-6 && dist_to_hint >= best_dist) => {}
-                _ => best = Some((score, dist_to_hint, idx)),
-            }
-        }
-
-        best.map(|(_, _, idx)| idx)
-    }
-
-    /// 解析自由格式的航路字符串（高容错性）
-    pub fn parse_flexible(&self, route_string: &str) -> Result<ParsedRoute> {
-        // 实现更宽松的解析逻辑
-        let mut parsed = self.parse(route_string)?;
-
-        // 如果标准解析失败，尝试更多启发式方法
-        if !parsed.is_valid {
-            self.apply_heuristics(&mut parsed)?;
-        }
-
+        parsed.is_valid =
+            parsed.errors.is_empty() && parsed.departure.is_some() && parsed.destination.is_some();
         Ok(parsed)
     }
 
-    /// 应用启发式规则
-    fn apply_heuristics(&self, parsed: &mut ParsedRoute) -> Result<()> {
-        // 1. 如果只有两个ICAO代码，假设是起点和终点
-        let icao_codes: Vec<_> = parsed
-            .elements
-            .iter()
-            .filter_map(|e| match e {
-                RouteElement::Waypoint(wp) if validate_icao(&wp.identifier) => {
-                    Some(wp.identifier.clone())
-                }
-                RouteElement::Unknown(s) if validate_icao(s) => Some(s.clone()),
-                _ => None,
-            })
-            .collect();
-
-        if icao_codes.len() >= 2 && parsed.departure.is_none() {
-            if let Ok(dep) = self.db_pool.load_airport(&icao_codes[0]) {
-                parsed.departure = Some(dep);
-            }
-        }
-
-        if icao_codes.len() >= 2 && parsed.destination.is_none() {
-            if let Ok(dest) = self.db_pool.load_airport(&icao_codes[icao_codes.len() - 1]) {
-                parsed.destination = Some(dest);
-            }
-        }
-
-        // 2. 尝试识别未知元素
-        let mut new_elements = Vec::new();
-        for element in &parsed.elements {
-            if let RouteElement::Unknown(s) = element {
-                // 尝试各种可能性
-                if let Ok(Some(wp)) = self.try_find_waypoint(s) {
-                    new_elements.push(RouteElement::Waypoint(wp));
-                    continue;
-                }
-                new_elements.push(element.clone());
-            } else {
-                new_elements.push(element.clone());
-            }
-        }
-        parsed.elements = new_elements;
-
-        // 重新验证
-        parsed.is_valid = parsed.errors.is_empty()
-            && parsed.departure.is_some()
-            && parsed.destination.is_some();
-
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_normalize_input() {
-        let input = "ZBAA -> TEPID via G212 DCT VYK STAR ZSPD";
-        let parser = RouteParser::new(Arc::new(
-            DatabasePool::new("test.db", 1).unwrap()
-        ));
-        let normalized = parser.normalize_input(input);
-        assert!(normalized.contains("ZBAA"));
-        assert!(normalized.contains("ZSPD"));
-    }
-
-    #[test]
-    fn test_airway_pattern() {
-        assert!(AIRWAY_PATTERN.is_match("G212"));
-        assert!(AIRWAY_PATTERN.is_match("A593"));
-        assert!(AIRWAY_PATTERN.is_match("J146"));
-        assert!(!AIRWAY_PATTERN.is_match("ZBAA"));
-        assert!(!AIRWAY_PATTERN.is_match("123"));
-    }
-
-    #[test]
-    fn test_runway_pattern() {
-        assert!(RUNWAY_PATTERN.is_match("36R"));
-        assert!(RUNWAY_PATTERN.is_match("09"));
-        assert!(RUNWAY_PATTERN.is_match("18L"));
-        assert!(!RUNWAY_PATTERN.is_match("37R"));
-        assert!(!RUNWAY_PATTERN.is_match("ABC"));
+    pub fn parse_flexible(&self, route_string: &str) -> Result<ParsedRoute> {
+        // Partial elements are always returned; unresolved input never becomes valid by omission.
+        self.parse(route_string)
     }
 }

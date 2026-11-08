@@ -1,248 +1,144 @@
+use crate::geo::{haversine_distance_nm, EARTH_RADIUS_NM};
 use crate::models::{Coordinate, Waypoint};
-use rstar::{RTree, RTreeObject, AABB};
+use rstar::{PointDistance, RTree, RTreeObject, AABB};
 
-/// 空间索引项
-#[derive(Debug, Clone)]
-struct SpatialWaypoint {
-    waypoint: Waypoint,
+fn xyz(c: &Coordinate) -> [f64; 3] {
+    let (lat, lon) = (c.latitude.to_radians(), c.longitude.to_radians());
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
 }
 
-impl RTreeObject for SpatialWaypoint {
-    type Envelope = AABB<[f64; 2]>;
-
+struct Entry {
+    point: [f64; 3],
+    index: usize,
+}
+impl RTreeObject for Entry {
+    type Envelope = AABB<[f64; 3]>;
     fn envelope(&self) -> Self::Envelope {
-        let point = [
-            self.waypoint.coordinate.longitude,
-            self.waypoint.coordinate.latitude,
-        ];
-        AABB::from_point(point)
+        AABB::from_point(self.point)
+    }
+}
+impl PointDistance for Entry {
+    fn distance_2(&self, p: &[f64; 3]) -> f64 {
+        (0..3).map(|i| (self.point[i] - p[i]).powi(2)).sum()
     }
 }
 
-/// 空间索引（基于R-tree）
+#[derive(Default)]
 pub struct SpatialIndex {
-    rtree: RTree<SpatialWaypoint>,
+    tree: RTree<Entry>,
+    waypoints: Vec<Waypoint>,
 }
-
 impl SpatialIndex {
-    /// 创建新的空间索引
     pub fn new() -> Self {
-        Self {
-            rtree: RTree::new(),
-        }
+        Self::default()
     }
-
-    /// 批量插入航点
     pub fn bulk_insert(&mut self, waypoints: Vec<Waypoint>) {
-        let spatial_waypoints: Vec<SpatialWaypoint> = waypoints
-            .into_iter()
-            .map(|waypoint| SpatialWaypoint { waypoint })
-            .collect();
-
-        self.rtree = RTree::bulk_load(spatial_waypoints);
+        self.tree = RTree::bulk_load(
+            waypoints
+                .iter()
+                .enumerate()
+                .map(|(index, waypoint)| Entry {
+                    point: xyz(&waypoint.coordinate),
+                    index,
+                })
+                .collect(),
+        );
+        self.waypoints = waypoints;
     }
-
-    /// 插入单个航点
     pub fn insert(&mut self, waypoint: Waypoint) {
-        self.rtree.insert(SpatialWaypoint { waypoint });
+        self.tree.insert(Entry {
+            point: xyz(&waypoint.coordinate),
+            index: self.waypoints.len(),
+        });
+        self.waypoints.push(waypoint);
     }
-
-    /// 查找最近的航点
     pub fn find_nearest(&self, coord: &Coordinate) -> Option<Waypoint> {
-        use crate::geo::haversine_distance_nm;
-
-        // 使用较小的半径先尝试查找
-        let mut radius = 50.0; // 从50海里开始
-        let max_radius = 1000.0; // 最大1000海里
-
-        while radius <= max_radius {
-            let nearby = self.find_within_radius(coord, radius);
-            if !nearby.is_empty() {
-                // 找到最近的一个
-                return nearby
-                    .into_iter()
-                    .min_by(|a, b| {
-                        let dist_a = haversine_distance_nm(coord, &a.coordinate);
-                        let dist_b = haversine_distance_nm(coord, &b.coordinate);
-                        dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-            }
-            radius *= 2.0; // 扩大搜索范围
+        self.tree
+            .nearest_neighbor(&xyz(coord))
+            .map(|e| self.waypoints[e.index].clone())
+    }
+    pub fn find_within_radius(&self, coord: &Coordinate, radius_nm: f64) -> Vec<Waypoint> {
+        if !radius_nm.is_finite() || radius_nm < 0.0 {
+            return Vec::new();
         }
-
-        None
-    }
-
-    /// 查找指定半径内的所有航点
-    /// radius_nm: 搜索半径（海里）
-    pub fn find_within_radius(
-        &self,
-        coord: &Coordinate,
-        radius_nm: f64,
-    ) -> Vec<Waypoint> {
-        use crate::geo::haversine_distance_nm;
-
-        // 将海里转换为大约的经纬度偏移
-        // 1海里 ≈ 1/60度纬度
-        let delta = radius_nm / 60.0;
-
-        let min_point = [coord.longitude - delta, coord.latitude - delta];
-        let max_point = [coord.longitude + delta, coord.latitude + delta];
-
-        let envelope = AABB::from_corners(min_point, max_point);
-
-        // 获取边界框内的所有点
-        let candidates: Vec<Waypoint> = self
-            .rtree
-            .locate_in_envelope(&envelope)
-            .map(|sp| sp.waypoint.clone())
-            .collect();
-
-        // 过滤出真正在半径内的点（使用精确的大圆距离）
-        candidates
-            .into_iter()
-            .filter(|wp| {
-                haversine_distance_nm(coord, &wp.coordinate) <= radius_nm
+        let chord = 2.0
+            * (radius_nm / EARTH_RADIUS_NM / 2.0)
+                .min(std::f64::consts::FRAC_PI_2)
+                .sin();
+        let mut points: Vec<_> = self
+            .tree
+            .locate_within_distance(xyz(coord), chord * chord + 1e-14)
+            .filter_map(|e| {
+                let point = &self.waypoints[e.index];
+                let d = haversine_distance_nm(coord, &point.coordinate);
+                (d <= radius_nm + 1e-9).then_some((d, point))
             })
-            .collect()
+            .collect();
+        points.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then(a.1.identifier.cmp(&b.1.identifier))
+        });
+        points.into_iter().map(|(_, p)| p.clone()).collect()
     }
-
-    /// 查找k个最近的航点
     pub fn find_k_nearest(&self, coord: &Coordinate, k: usize) -> Vec<Waypoint> {
-        use crate::geo::haversine_distance_nm;
-
-        let mut candidates: Vec<_> = self
-            .find_within_radius(coord, 500.0) // 500海里半径
-            .into_iter()
-            .map(|wp| {
-                let dist = haversine_distance_nm(coord, &wp.coordinate);
-                (wp, dist)
-            })
-            .collect();
-
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        candidates
-            .into_iter()
+        self.tree
+            .nearest_neighbor_iter(&xyz(coord))
             .take(k)
-            .map(|(wp, _)| wp)
+            .map(|e| self.waypoints[e.index].clone())
             .collect()
     }
-
-    /// 查找指定标识符的航点
     pub fn find_by_identifier(&self, identifier: &str) -> Vec<Waypoint> {
-        self.rtree
+        self.waypoints
             .iter()
-            .filter(|sp| sp.waypoint.identifier == identifier)
-            .map(|sp| sp.waypoint.clone())
+            .filter(|p| p.identifier.eq_ignore_ascii_case(identifier))
+            .cloned()
             .collect()
     }
-
-    /// 获取索引中的航点数量
     pub fn size(&self) -> usize {
-        self.rtree.size()
+        self.tree.size()
     }
-
-    /// 清空索引
     pub fn clear(&mut self) {
-        self.rtree = RTree::new();
-    }
-}
-
-impl Default for SpatialIndex {
-    fn default() -> Self {
-        Self::new()
+        self.tree = RTree::new();
+        self.waypoints.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::WaypointType;
-
-    fn create_test_waypoint(id: &str, lat: f64, lon: f64) -> Waypoint {
-        Waypoint {
-            identifier: id.to_string(),
-            icao_code: "ZB".to_string(),
-            name: Some(id.to_string()),
-            coordinate: Coordinate::new(lat, lon).unwrap(),
-            waypoint_type: WaypointType::Enroute,
-            usage: None,
-            id: None,
-        }
-    }
-
     #[test]
-    fn test_spatial_index_insert_and_search() {
+    fn payload_indices_survive_insert_replace_and_clear() {
         let mut index = SpatialIndex::new();
-
-        let waypoints = vec![
-            create_test_waypoint("WP1", 40.0, 116.0),
-            create_test_waypoint("WP2", 40.5, 116.5),
-            create_test_waypoint("WP3", 41.0, 117.0),
-        ];
-
-        index.bulk_insert(waypoints);
-
-        assert_eq!(index.size(), 3);
-
-        let center = Coordinate::new(40.0, 116.0).unwrap();
-        let nearest = index.find_nearest(&center);
-        assert!(nearest.is_some());
-        assert_eq!(nearest.unwrap().identifier, "WP1");
+        index.insert(Waypoint::simple("OLD", 0.0, 0.0).unwrap());
+        index.bulk_insert(vec![Waypoint::simple("NEW", 1.0, 1.0).unwrap()]);
+        index.insert(Waypoint::simple("NEXT", 2.0, 2.0).unwrap());
+        assert_eq!(index.size(), 2);
+        assert!(index.find_by_identifier("OLD").is_empty());
+        let nearest = index.find_k_nearest(&Coordinate::new(2.0, 2.0).unwrap(), 2);
+        assert_eq!(nearest[0].identifier, "NEXT");
+        assert_eq!(nearest[1].identifier, "NEW");
+        index.clear();
+        assert_eq!(index.size(), 0);
+        assert!(index
+            .find_nearest(&Coordinate::new(0.0, 0.0).unwrap())
+            .is_none());
+        index.insert(Waypoint::simple("RESET", 0.0, 0.0).unwrap());
+        assert_eq!(index.find_by_identifier("reset")[0].identifier, "RESET");
     }
-
     #[test]
-    fn test_find_within_radius() {
+    fn high_latitude_and_dateline() {
         let mut index = SpatialIndex::new();
-
-        let waypoints = vec![
-            create_test_waypoint("NEAR", 40.0, 116.0),
-            create_test_waypoint("FAR", 50.0, 120.0),
-        ];
-
-        index.bulk_insert(waypoints);
-
-        let center = Coordinate::new(40.0, 116.0).unwrap();
-        let nearby = index.find_within_radius(&center, 100.0);
-
-        assert_eq!(nearby.len(), 1);
-        assert_eq!(nearby[0].identifier, "NEAR");
-    }
-
-    #[test]
-    fn test_find_k_nearest() {
-        let mut index = SpatialIndex::new();
-
-        let waypoints = vec![
-            create_test_waypoint("WP1", 40.0, 116.0),
-            create_test_waypoint("WP2", 40.1, 116.1),
-            create_test_waypoint("WP3", 40.2, 116.2),
-            create_test_waypoint("WP4", 40.3, 116.3),
-        ];
-
-        index.bulk_insert(waypoints);
-
-        let center = Coordinate::new(40.0, 116.0).unwrap();
-        let nearest_3 = index.find_k_nearest(&center, 3);
-
-        assert_eq!(nearest_3.len(), 3);
-        assert_eq!(nearest_3[0].identifier, "WP1");
-    }
-
-    #[test]
-    fn test_find_by_identifier() {
-        let mut index = SpatialIndex::new();
-
-        let waypoints = vec![
-            create_test_waypoint("TEPID", 40.0, 116.0),
-            create_test_waypoint("VYK", 30.0, 120.0),
-        ];
-
-        index.bulk_insert(waypoints);
-
-        let found = index.find_by_identifier("TEPID");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].identifier, "TEPID");
+        index.bulk_insert(vec![
+            Waypoint::simple("POLAR", 60.0, 1.5).unwrap(),
+            Waypoint::simple("DATE", 0.0, -179.9).unwrap(),
+        ]);
+        assert_eq!(
+            index.find_within_radius(&Coordinate::new(60.0, 0.0).unwrap(), 60.0)[0].identifier,
+            "POLAR"
+        );
+        assert_eq!(
+            index.find_within_radius(&Coordinate::new(0.0, 179.9).unwrap(), 20.0)[0].identifier,
+            "DATE"
+        );
     }
 }

@@ -1,183 +1,132 @@
-// Go FFI调用示例
-//
-// 使用方法:
-// 1. 先编译Rust库: cargo build --release
-// 2. 编译并运行: go run examples/ffi_example.go
-
 package main
 
-// #cgo LDFLAGS: -L./target/release -lroutekit
-// #include "routekit.h"
-// #include <stdlib.h>
+/*
+#cgo CFLAGS: -I${SRCDIR}/..
+#cgo LDFLAGS: -lroutekit
+#include "routekit.h"
+#include <stdlib.h>
+*/
 import "C"
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"runtime"
 	"unsafe"
 )
 
-// Route 航路结构
-type Route struct {
-	Departure struct {
-		IcaoCode   string `json:"icao_code"`
-		Identifier string `json:"identifier"`
-		Coordinate struct {
-			Latitude  float64 `json:"latitude"`
-			Longitude float64 `json:"longitude"`
-		} `json:"coordinate"`
-	} `json:"departure"`
-	Destination struct {
-		IcaoCode   string `json:"icao_code"`
-		Identifier string `json:"identifier"`
-		Coordinate struct {
-			Latitude  float64 `json:"latitude"`
-			Longitude float64 `json:"longitude"`
-		} `json:"coordinate"`
-	} `json:"destination"`
-	Segments         []interface{} `json:"segments"`
-	TotalDistanceNm  float64       `json:"total_distance_nm"`
-	EstimatedTimeMin *float64      `json:"estimated_time_minutes"`
+type RouteResult struct {
+	RouteString     string  `json:"route_string"`
+	TotalDistanceNM float64 `json:"total_distance_nm"`
 }
 
-// ParsedRoute 解析后的航路
 type ParsedRoute struct {
-	RawInput    string        `json:"raw_input"`
-	IsValid     bool          `json:"is_valid"`
-	Elements    []interface{} `json:"elements"`
-	Warnings    []string      `json:"warnings"`
-	Errors      []string      `json:"errors"`
-	Departure   interface{}   `json:"departure"`
-	Destination interface{}   `json:"destination"`
+	RawInput string            `json:"raw_input"`
+	IsValid  bool              `json:"is_valid"`
+	Elements []json.RawMessage `json:"elements"`
+	Warnings []string          `json:"warnings"`
+	Errors   []string          `json:"errors"`
 }
 
-// RouteKit Go包装
-type RouteKit struct {
-	handle unsafe.Pointer
-}
+type RouteKit struct{ handle unsafe.Pointer }
 
-// New 创建RouteKit实例
-func New(dbPath string) (*RouteKit, error) {
-	cPath := C.CString(dbPath)
-	defer C.free(unsafe.Pointer(cPath))
+func lastError() error { return errors.New(C.GoString(C.routekit_last_error())) }
 
-	handle := C.routekit_new(cPath)
+func New(database string) (*RouteKit, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	path := C.CString(database)
+	defer C.free(unsafe.Pointer(path))
+	handle := C.routekit_new(path)
 	if handle == nil {
-		return nil, fmt.Errorf("failed to create RouteKit instance")
+		return nil, lastError()
 	}
-
 	return &RouteKit{handle: handle}, nil
 }
 
-// Close 关闭RouteKit实例
-func (rk *RouteKit) Close() {
-	if rk.handle != nil {
-		C.routekit_free(rk.handle)
-		rk.handle = nil
+func (kit *RouteKit) Close() {
+	if kit.handle != nil {
+		C.routekit_free(kit.handle)
+		kit.handle = nil
 	}
 }
 
-// FindRoutes 查找航路
-func (rk *RouteKit) FindRoutes(departure, destination string, maxRoutes int) ([]Route, error) {
-	if rk.handle == nil {
-		return nil, fmt.Errorf("RouteKit instance is closed")
+func (kit *RouteKit) FindRoutes(departure, destination string, count int) ([]RouteResult, error) {
+	if kit.handle == nil || count < 0 {
+		return nil, errors.New("invalid handle or route count")
 	}
-
-	cDeparture := C.CString(departure)
-	defer C.free(unsafe.Pointer(cDeparture))
-
-	cDestination := C.CString(destination)
-	defer C.free(unsafe.Pointer(cDestination))
-
-	cJson := C.routekit_find_routes(rk.handle, cDeparture, cDestination, C.size_t(maxRoutes))
-	if cJson == nil {
-		return nil, fmt.Errorf("failed to find routes")
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	dep, dest := C.CString(departure), C.CString(destination)
+	defer C.free(unsafe.Pointer(dep))
+	defer C.free(unsafe.Pointer(dest))
+	output := C.routekit_find_routes(kit.handle, dep, dest, C.size_t(count))
+	if output == nil {
+		return nil, lastError()
 	}
-	defer C.routekit_free_string(cJson)
-
-	jsonStr := C.GoString(cJson)
-
-	var routes []Route
-	if err := json.Unmarshal([]byte(jsonStr), &routes); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	defer C.routekit_free_string(output)
+	var routes []RouteResult
+	if err := json.Unmarshal([]byte(C.GoString(output)), &routes); err != nil {
+		return nil, err
 	}
-
 	return routes, nil
 }
 
-// ParseRoute 解析航路字符串
-func (rk *RouteKit) ParseRoute(routeString string) (*ParsedRoute, error) {
-	if rk.handle == nil {
-		return nil, fmt.Errorf("RouteKit instance is closed")
+func (kit *RouteKit) ParseRoute(input string) (*ParsedRoute, error) {
+	if kit.handle == nil {
+		return nil, errors.New("closed handle")
 	}
-
-	cRouteString := C.CString(routeString)
-	defer C.free(unsafe.Pointer(cRouteString))
-
-	cJson := C.routekit_parse_route(rk.handle, cRouteString)
-	if cJson == nil {
-		return nil, fmt.Errorf("failed to parse route")
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	text := C.CString(input)
+	defer C.free(unsafe.Pointer(text))
+	output := C.routekit_parse_route(kit.handle, text)
+	if output == nil {
+		return nil, lastError()
 	}
-	defer C.routekit_free_string(cJson)
-
-	jsonStr := C.GoString(cJson)
-
+	defer C.routekit_free_string(output)
 	var parsed ParsedRoute
-	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON: %v", err)
+	if err := json.Unmarshal([]byte(C.GoString(output)), &parsed); err != nil {
+		return nil, err
 	}
-
 	return &parsed, nil
 }
 
-func main() {
-	fmt.Println("=== RouteKit Go FFI 示例 ===\n")
-
-	// 创建RouteKit实例
-	kit, err := New("raw_data/e_dfd_PMDG.s3db")
+func run() error {
+	database, departure, destination := "raw_data/e_navdata.s3db", "ZBAA", "ZSPD"
+	if len(os.Args) > 1 {
+		database = os.Args[1]
+	}
+	if len(os.Args) > 2 {
+		departure = os.Args[2]
+	}
+	if len(os.Args) > 3 {
+		destination = os.Args[3]
+	}
+	kit, err := New(database)
 	if err != nil {
-		fmt.Printf("错误: %v\n", err)
-		return
+		return err
 	}
 	defer kit.Close()
-
-	fmt.Println("✓ RouteKit实例创建成功\n")
-
-	// 解析航路字符串
-	fmt.Println("1. 解析航路字符串...")
-	routeStr := "ZBAA SID TEPID G212 VYK STAR ZSPD"
-	parsed, err := kit.ParseRoute(routeStr)
+	routes, err := kit.FindRoutes(departure, destination, 1)
 	if err != nil {
-		fmt.Printf("解析失败: %v\n", err)
-	} else {
-		fmt.Printf("   输入: %s\n", parsed.RawInput)
-		fmt.Printf("   有效: %v\n", parsed.IsValid)
-		fmt.Printf("   元素数: %d\n", len(parsed.Elements))
-		if len(parsed.Warnings) > 0 {
-			fmt.Printf("   警告: %v\n", parsed.Warnings)
-		}
-		if len(parsed.Errors) > 0 {
-			fmt.Printf("   错误: %v\n", parsed.Errors)
-		}
+		return err
 	}
-	fmt.Println()
-
-	// 查找航路
-	fmt.Println("2. 查找航路...")
-	routes, err := kit.FindRoutes("ZBAA", "ZSPD", 3)
-	if err != nil {
-		fmt.Printf("查找失败: %v\n", err)
-	} else {
-		fmt.Printf("   找到 %d 条航路\n", len(routes))
-		for i, route := range routes {
-			fmt.Printf("\n   航路 %d:\n", i+1)
-			fmt.Printf("     起飞: %s\n", route.Departure.Identifier)
-			fmt.Printf("     目的: %s\n", route.Destination.Identifier)
-			fmt.Printf("     总距离: %.2f 海里\n", route.TotalDistanceNm)
-			if route.EstimatedTimeMin != nil {
-				fmt.Printf("     预计时间: %.0f 分钟\n", *route.EstimatedTimeMin)
-			}
+	for _, route := range routes {
+		fmt.Printf("%s (%.1f NM)\n", route.RouteString, route.TotalDistanceNM)
+		parsed, err := kit.ParseRoute(route.RouteString)
+		if err != nil {
+			return err
 		}
+		fmt.Printf("valid=%v, warnings=%v, errors=%v\n", parsed.IsValid, parsed.Warnings, parsed.Errors)
 	}
+	return nil
+}
 
-	fmt.Println("\n=== 示例完成 ===")
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }

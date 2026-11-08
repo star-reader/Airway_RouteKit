@@ -1,36 +1,98 @@
 use crate::error::{Result, RouteKitError};
 use crate::models::*;
+use crate::network::Network;
+use parking_lot::RwLock;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, OptionalExtension, Row};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct DatabasePool {
     pool: Pool<SqliteConnectionManager>,
+    network: RwLock<Option<Arc<Network>>>,
+    gateways: RwLock<HashMap<(String, bool), Vec<Waypoint>>>,
+    waypoint_cache: RwLock<HashMap<String, Vec<Waypoint>>>,
 }
 
 impl DatabasePool {
     pub fn new<P: AsRef<Path>>(db_path: P, pool_size: u32) -> Result<Self> {
-        let manager = SqliteConnectionManager::file(db_path);
-        let pool = Pool::builder()
-            .max_size(pool_size)
-            .build(manager)?;
+        if pool_size == 0 {
+            return Err(RouteKitError::ConfigError(
+                "Database pool size must be positive".into(),
+            ));
+        }
+        std::fs::metadata(db_path.as_ref())?;
+        let manager = SqliteConnectionManager::file(db_path).with_flags(
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        );
+        let pool = Pool::builder().max_size(pool_size).build(manager)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            network: RwLock::new(None),
+            gateways: RwLock::new(HashMap::new()),
+            waypoint_cache: RwLock::new(HashMap::new()),
+        })
     }
 
     fn get_connection(&self) -> Result<r2d2::PooledConnection<SqliteConnectionManager>> {
         self.pool.get().map_err(|e| e.into())
     }
 
+    pub(crate) fn network(&self) -> Result<Arc<Network>> {
+        if let Some(graph) = self.network.read().as_ref() {
+            return Ok(Arc::clone(graph));
+        }
+        let mut slot = self.network.write();
+        if let Some(graph) = slot.as_ref() {
+            return Ok(Arc::clone(graph));
+        }
+        let conn = self.get_connection()?;
+        let graph = Arc::new(Network::load(&conn)?);
+        *slot = Some(Arc::clone(&graph));
+        Ok(graph)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        *self.network.write() = None;
+        self.gateways.write().clear();
+        self.waypoint_cache.write().clear();
+    }
+
+    fn airport_gateways(&self, airport: &str, departure: bool) -> Result<Vec<Waypoint>> {
+        let key = (airport.trim().to_uppercase(), departure);
+        if let Some(points) = self.gateways.read().get(&key) {
+            return Ok(points.clone());
+        }
+        let conn = self.get_connection()?;
+        let points = crate::gateways::load(&conn, &key.0, departure)?;
+        self.gateways.write().insert(key, points.clone());
+        Ok(points)
+    }
+
+    pub(crate) fn procedure_exists(
+        &self,
+        airport: &str,
+        procedure: &str,
+        departure: bool,
+    ) -> Result<bool> {
+        let table = if departure { "tbl_sids" } else { "tbl_stars" };
+        let conn = self.get_connection()?;
+        Ok(conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE airport_identifier=?1 AND procedure_identifier=?2)"),
+            params![airport,procedure], |r|r.get(0))?)
+    }
+
     pub fn load_airport(&self, icao: &str) -> Result<Airport> {
+        let icao = icao.trim().to_uppercase();
         let conn = self.get_connection()?;
         let mut stmt = conn.prepare(
             "SELECT icao_code, airport_identifier, airport_identifier_3letter, 
                     airport_name, airport_ref_latitude, airport_ref_longitude,
                     ifr_capability, elevation, transition_altitude, transition_level
              FROM tbl_airports 
-             WHERE airport_identifier = ?1 OR icao_code = ?1"
+             WHERE airport_identifier = ?1",
         )?;
 
         let airport = stmt
@@ -40,10 +102,8 @@ impl DatabasePool {
                     identifier: row.get(1)?,
                     identifier_3letter: row.get(2)?,
                     name: row.get(3)?,
-                    coordinate: Coordinate::new(
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, f64>(5)?,
-                    ).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+                    coordinate: Coordinate::new(row.get::<_, f64>(4)?, row.get::<_, f64>(5)?)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
                     ifr_capability: row.get(6)?,
                     elevation: row.get(7)?,
                     transition_altitude: row.get(8)?,
@@ -62,14 +122,14 @@ impl DatabasePool {
             "SELECT waypoint_identifier, icao_code, waypoint_name, 
                     waypoint_latitude, waypoint_longitude, waypoint_type, 
                     waypoint_usage, id
-             FROM tbl_enroute_waypoints"
+             FROM tbl_enroute_waypoints",
         )?;
 
         let waypoints = stmt
             .query_map([], |row| {
                 let lat: f64 = row.get(3)?;
                 let lon: f64 = row.get(4)?;
-                
+
                 Ok(Waypoint {
                     identifier: row.get::<_, String>(0)?,
                     icao_code: row.get::<_, String>(1).unwrap_or_default(),
@@ -92,6 +152,11 @@ impl DatabasePool {
     }
 
     pub fn find_waypoints(&self, identifier: &str) -> Result<Vec<Waypoint>> {
+        let identifier = identifier.trim().to_uppercase();
+        if let Some(points) = self.waypoint_cache.read().get(&identifier) {
+            return Ok(points.clone());
+        }
+        let graph = self.network()?;
         let conn = self.get_connection()?;
 
         let mut waypoints = Vec::new();
@@ -102,7 +167,7 @@ impl DatabasePool {
                     waypoint_latitude, waypoint_longitude, waypoint_type, 
                     waypoint_usage, id
              FROM tbl_enroute_waypoints 
-             WHERE waypoint_identifier = ?1"
+             WHERE waypoint_identifier = ?1",
         )?;
 
         let enroute_waypoints = stmt
@@ -130,7 +195,7 @@ impl DatabasePool {
             "SELECT waypoint_identifier, icao_code, waypoint_name, 
                     waypoint_latitude, waypoint_longitude, id
              FROM tbl_terminal_waypoints 
-             WHERE waypoint_identifier = ?1"
+             WHERE waypoint_identifier = ?1",
         )?;
 
         let terminal_waypoints = stmt
@@ -154,15 +219,55 @@ impl DatabasePool {
         waypoints.extend(terminal_waypoints);
 
         // VOR/VHF 台站（真实表：tbl_vhfnavaids；兼容旧表名：tbl_vor）
-        self.extend_waypoints_from_vhf_table(&conn, &mut waypoints, "tbl_vhfnavaids", identifier)?;
-        self.extend_waypoints_from_vhf_table(&conn, &mut waypoints, "tbl_vor", identifier)?;
+        self.extend_waypoints_from_vhf_table(&conn, &mut waypoints, "tbl_vhfnavaids", &identifier)?;
+        self.extend_waypoints_from_vhf_table(&conn, &mut waypoints, "tbl_vor", &identifier)?;
 
         // NDB 台站（真实表：tbl_*_ndbnavaids；兼容旧表名：tbl_*_ndb）
-        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_enroute_ndbnavaids", identifier)?;
-        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_terminal_ndbnavaids", identifier)?;
-        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_enroute_ndb", identifier)?;
-        self.extend_waypoints_from_ndb_table(&conn, &mut waypoints, "tbl_terminal_ndb", identifier)?;
-
+        self.extend_waypoints_from_ndb_table(
+            &conn,
+            &mut waypoints,
+            "tbl_enroute_ndbnavaids",
+            &identifier,
+        )?;
+        self.extend_waypoints_from_ndb_table(
+            &conn,
+            &mut waypoints,
+            "tbl_terminal_ndbnavaids",
+            &identifier,
+        )?;
+        self.extend_waypoints_from_ndb_table(
+            &conn,
+            &mut waypoints,
+            "tbl_enroute_ndb",
+            &identifier,
+        )?;
+        self.extend_waypoints_from_ndb_table(
+            &conn,
+            &mut waypoints,
+            "tbl_terminal_ndb",
+            &identifier,
+        )?;
+        for &n in graph.by_name.get(&identifier).into_iter().flatten() {
+            let wp = &graph.nodes[n];
+            if !waypoints.iter().any(|p| {
+                p.icao_code == wp.icao_code
+                    && crate::geo::haversine_distance_nm(&p.coordinate, &wp.coordinate) < 0.05
+            }) {
+                waypoints.push(wp.clone());
+            }
+        }
+        waypoints.sort_by(|a, b| {
+            a.icao_code
+                .cmp(&b.icao_code)
+                .then(a.coordinate.latitude.total_cmp(&b.coordinate.latitude))
+                .then(a.coordinate.longitude.total_cmp(&b.coordinate.longitude))
+                .then(a.id.cmp(&b.id))
+        });
+        let mut cache = self.waypoint_cache.write();
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert(identifier, waypoints.clone());
         Ok(waypoints)
     }
 
@@ -260,57 +365,14 @@ impl DatabasePool {
 
     /// 查找航路段
     pub fn find_airway_segments(&self, route_identifier: &str) -> Result<Vec<AirwaySegment>> {
-        let conn = self.get_connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT route_identifier, seqno, waypoint_identifier, 
-                    waypoint_latitude, waypoint_longitude, icao_code,
-                    route_type, flightlevel, direction_restriction,
-                    minimum_altitude1, minimum_altitude2, maximum_altitude,
-                    outbound_course, inbound_course, inbound_distance
-             FROM tbl_enroute_airways 
-             WHERE route_identifier = ?1 
-             ORDER BY seqno"
-        )?;
-
-        let segments = stmt
-            .query_map(params![route_identifier], |row| {
-                let route_type = match row.get::<_, Option<String>>(6)?.as_deref() {
-                    Some("H") => RouteType::High,
-                    Some("L") => RouteType::Low,
-                    Some("R") => RouteType::RNAV,
-                    _ => RouteType::Other,
-                };
-
-                let lat: f64 = row.get(3)?;
-                let lon: f64 = row.get(4)?;
-
-                Ok(AirwaySegment {
-                    route_identifier: row.get::<_, String>(0)?,
-                    sequence: row.get::<_, i32>(1)?,
-                    waypoint: Waypoint {
-                        identifier: row.get::<_, String>(2)?,
-                        coordinate: Coordinate::new(lat, lon)
-                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                        icao_code: row.get::<_, String>(5).unwrap_or_default(),
-                        name: None,
-                        waypoint_type: WaypointType::Enroute,
-                        usage: None,
-                        id: None,
-                    },
-                    route_type,
-                    flight_level: row.get::<_, Option<String>>(7)?,
-                    direction_restriction: row.get::<_, Option<String>>(8)?,
-                    minimum_altitude1: row.get::<_, Option<i32>>(9)?,
-                    minimum_altitude2: row.get::<_, Option<i32>>(10)?,
-                    maximum_altitude: row.get::<_, Option<i32>>(11)?,
-                    outbound_course: row.get::<_, Option<f64>>(12)?,
-                    inbound_course: row.get::<_, Option<f64>>(13)?,
-                    inbound_distance: row.get::<_, Option<f64>>(14)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(segments)
+        let graph = self.network()?;
+        Ok(graph
+            .airway_rows
+            .get(&route_identifier.trim().to_uppercase())
+            .into_iter()
+            .flatten()
+            .map(|&r| graph.segment(r))
+            .collect())
     }
 
     /// 查找机场的SID
@@ -320,20 +382,22 @@ impl DatabasePool {
             "SELECT DISTINCT procedure_identifier, transition_identifier
              FROM tbl_sids 
              WHERE airport_identifier = ?1
-             LIMIT 5"
+             ORDER BY procedure_identifier, transition_identifier",
         )?;
 
         let mut sids = Vec::new();
-        let rows = stmt.query_map(params![airport_icao], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        })?;
+        let rows = stmt
+            .query_map(params![airport_icao], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
 
         for row in rows {
-            let (procedure_id, transition_id) = row?;
-            let waypoints = self.load_sid_waypoints(airport_icao, &procedure_id, transition_id.as_deref())?;
+            let (procedure_id, transition_id) = row;
+            let waypoints =
+                self.load_sid_waypoints(airport_icao, &procedure_id, transition_id.as_deref())?;
             sids.push(Sid {
                 airport_identifier: airport_icao.to_string(),
                 procedure_identifier: procedure_id,
@@ -372,11 +436,17 @@ impl DatabasePool {
         };
 
         let mut stmt = conn.prepare(query)?;
-        
+
         let waypoints = if let Some(trans) = transition_id {
-            stmt.query_map(params![airport_icao, procedure_id, trans], Self::parse_sid_star_waypoint)?
+            stmt.query_map(
+                params![airport_icao, procedure_id, trans],
+                Self::parse_sid_star_waypoint,
+            )?
         } else {
-            stmt.query_map(params![airport_icao, procedure_id], Self::parse_sid_star_waypoint)?
+            stmt.query_map(
+                params![airport_icao, procedure_id],
+                Self::parse_sid_star_waypoint,
+            )?
         }
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -390,20 +460,22 @@ impl DatabasePool {
             "SELECT DISTINCT procedure_identifier, transition_identifier
              FROM tbl_stars 
              WHERE airport_identifier = ?1
-             LIMIT 5"
+             ORDER BY procedure_identifier, transition_identifier",
         )?;
 
         let mut stars = Vec::new();
-        let rows = stmt.query_map(params![airport_icao], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-            ))
-        })?;
+        let rows = stmt
+            .query_map(params![airport_icao], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        drop(conn);
 
         for row in rows {
-            let (procedure_id, transition_id) = row?;
-            let waypoints = self.load_star_waypoints(airport_icao, &procedure_id, transition_id.as_deref())?;
+            let (procedure_id, transition_id) = row;
+            let waypoints =
+                self.load_star_waypoints(airport_icao, &procedure_id, transition_id.as_deref())?;
             stars.push(Star {
                 airport_identifier: airport_icao.to_string(),
                 procedure_identifier: procedure_id,
@@ -442,11 +514,17 @@ impl DatabasePool {
         };
 
         let mut stmt = conn.prepare(query)?;
-        
+
         let waypoints = if let Some(trans) = transition_id {
-            stmt.query_map(params![airport_icao, procedure_id, trans], Self::parse_sid_star_waypoint)?
+            stmt.query_map(
+                params![airport_icao, procedure_id, trans],
+                Self::parse_sid_star_waypoint,
+            )?
         } else {
-            stmt.query_map(params![airport_icao, procedure_id], Self::parse_sid_star_waypoint)?
+            stmt.query_map(
+                params![airport_icao, procedure_id],
+                Self::parse_sid_star_waypoint,
+            )?
         }
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -458,10 +536,8 @@ impl DatabasePool {
         Ok(SidStarWaypoint {
             sequence: row.get(0)?,
             waypoint_identifier: row.get(1)?,
-            coordinate: Coordinate::new(
-                row.get::<_, f64>(2)?,
-                row.get::<_, f64>(3)?,
-            ).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            coordinate: Coordinate::new(row.get::<_, f64>(2)?, row.get::<_, f64>(3)?)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
             path_termination: row.get(4)?,
             magnetic_course: row.get(5)?,
             route_distance: row.get(6)?,
@@ -478,282 +554,98 @@ impl DatabasePool {
         from_waypoint: &str,
         to_waypoint: &str,
     ) -> Result<Vec<String>> {
-        let conn = self.get_connection()?;
-        
-        // 查找包含这两个航点的航路
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT a1.route_identifier
-             FROM tbl_enroute_airways a1
-             JOIN tbl_enroute_airways a2 ON a1.route_identifier = a2.route_identifier
-             WHERE a1.waypoint_identifier = ?1 
-               AND a2.waypoint_identifier = ?2
-               AND a1.seqno < a2.seqno"
-        )?;
-
-        let airways = stmt
-            .query_map(params![from_waypoint, to_waypoint], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<String>, _>>()?;
-
-        Ok(airways)
+        let graph = self.network()?;
+        let from = self.find_waypoints(from_waypoint)?;
+        let to = self.find_waypoints(to_waypoint)?;
+        let mut names = Vec::new();
+        for name in graph.airways.iter() {
+            if from
+                .iter()
+                .any(|a| to.iter().any(|b| !graph.expand(name, a, b).is_empty()))
+            {
+                names.push(name.clone());
+            }
+        }
+        Ok(names)
     }
 
-    /// 查找在航路网络中且靠近指定坐标的航点
     pub fn find_airway_waypoints_near(
         &self,
         latitude: f64,
         longitude: f64,
         radius_degrees: f64,
     ) -> Result<Vec<Waypoint>> {
-        let conn = self.get_connection()?;
-        
-        let lat_min = latitude - radius_degrees;
-        let lat_max = latitude + radius_degrees;
-        let lon_min = longitude - radius_degrees;
-        let lon_max = longitude + radius_degrees;
-        
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT waypoint_identifier, icao_code, waypoint_latitude, waypoint_longitude
-             FROM tbl_enroute_airways
-             WHERE waypoint_latitude BETWEEN ?1 AND ?2
-               AND waypoint_longitude BETWEEN ?3 AND ?4
-             LIMIT 30"
-        )?;
-        
-        let waypoints = stmt
-            .query_map(params![lat_min, lat_max, lon_min, lon_max], |row| {
-                let lat: f64 = row.get(2)?;
-                let lon: f64 = row.get(3)?;
-                
-                Ok(Waypoint {
-                    identifier: row.get::<_, String>(0)?,
-                    icao_code: row.get::<_, String>(1).unwrap_or_default(),
-                    name: None,
-                    coordinate: Coordinate::new(lat, lon)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    waypoint_type: WaypointType::Enroute,
-                    usage: None,
-                    id: None,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        
-        Ok(waypoints)
+        let origin = Coordinate::new(latitude, longitude)?;
+        let graph = self.network()?;
+        let mut points: Vec<_> = graph
+            .nodes
+            .iter()
+            .filter_map(|p| {
+                let d = crate::geo::haversine_distance_nm(&origin, &p.coordinate);
+                (d <= radius_degrees * 60.0).then_some((d, p))
+            })
+            .collect();
+        points.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then(a.1.identifier.cmp(&b.1.identifier))
+        });
+        Ok(points.into_iter().map(|(_, p)| p.clone()).collect())
     }
 
-    /// 查找从指定航点出发的航路段
     pub fn find_outbound_airway_segments(
         &self,
         waypoint_identifier: &str,
     ) -> Result<Vec<AirwaySegment>> {
-        let conn = self.get_connection()?;
-        
-        // 简化查询：找到当前航点之后的所有航点（seqno更大的）
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT a2.route_identifier, a2.seqno, a2.waypoint_identifier,
-                    a2.waypoint_latitude, a2.waypoint_longitude, a2.icao_code,
-                    a2.route_type, a2.flightlevel, a2.direction_restriction,
-                    a2.minimum_altitude1, a2.minimum_altitude2, a2.maximum_altitude,
-                    a2.outbound_course, a2.inbound_course, a2.inbound_distance,
-                    a1.seqno as from_seqno
-             FROM tbl_enroute_airways a1
-             JOIN tbl_enroute_airways a2 ON a1.route_identifier = a2.route_identifier
-             WHERE a1.waypoint_identifier = ?1 
-               AND a2.seqno > a1.seqno
-             ORDER BY a1.route_identifier, (a2.seqno - a1.seqno)
-             LIMIT 100"
-        )?;
-
-        let segments = stmt
-            .query_map(params![waypoint_identifier], |row| {
-                let route_type = match row.get::<_, Option<String>>(6)?.as_deref() {
-                    Some("H") => RouteType::High,
-                    Some("L") => RouteType::Low,
-                    Some("R") => RouteType::RNAV,
-                    _ => RouteType::Other,
-                };
-
-                let lat: f64 = row.get(3)?;
-                let lon: f64 = row.get(4)?;
-
-                Ok(AirwaySegment {
-                    route_identifier: row.get::<_, String>(0)?,
-                    sequence: row.get::<_, i32>(1)?,
-                    waypoint: Waypoint {
-                        identifier: row.get::<_, String>(2)?,
-                        coordinate: Coordinate::new(lat, lon)
-                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                        icao_code: row.get::<_, String>(5).unwrap_or_default(),
-                        name: None,
-                        waypoint_type: WaypointType::Enroute,
-                        usage: None,
-                        id: None,
-                    },
-                    route_type,
-                    flight_level: row.get::<_, Option<String>>(7)?,
-                    direction_restriction: row.get::<_, Option<String>>(8)?,
-                    minimum_altitude1: row.get::<_, Option<i32>>(9)?,
-                    minimum_altitude2: row.get::<_, Option<i32>>(10)?,
-                    maximum_altitude: row.get::<_, Option<i32>>(11)?,
-                    outbound_course: row.get::<_, Option<f64>>(12)?,
-                    inbound_course: row.get::<_, Option<f64>>(13)?,
-                    inbound_distance: row.get::<_, Option<f64>>(14)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(segments)
+        let graph = self.network()?;
+        Ok(graph
+            .by_name
+            .get(waypoint_identifier)
+            .into_iter()
+            .flatten()
+            .flat_map(|&n| graph.outgoing[n].iter())
+            .map(|&e| {
+                let edge = &graph.edges[e];
+                graph.segment(edge.record + usize::from(!edge.reverse))
+            })
+            .collect())
     }
-    
-    /// 快速查找机场的SID出口航点（在航路网络中的航点）
+
     pub fn find_sid_exit_waypoints(&self, airport_icao: &str) -> Result<Vec<Waypoint>> {
-        let conn = self.get_connection()?;
-        
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT s.waypoint_identifier, s.waypoint_latitude, s.waypoint_longitude
-             FROM tbl_sids s
-             WHERE s.airport_identifier = ?1 
-               AND s.waypoint_identifier IS NOT NULL
-               AND s.waypoint_identifier IN (
-                 SELECT DISTINCT waypoint_identifier FROM tbl_enroute_airways
-               )
-             LIMIT 20"
-        )?;
-        
-        let waypoints = stmt
-            .query_map(params![airport_icao], |row| {
-                let lat: f64 = row.get(1)?;
-                let lon: f64 = row.get(2)?;
-                
-                Ok(Waypoint {
-                    identifier: row.get::<_, String>(0)?,
-                    icao_code: String::new(),
-                    name: None,
-                    coordinate: Coordinate::new(lat, lon)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    waypoint_type: WaypointType::Enroute,
-                    usage: None,
-                    id: None,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        
-        Ok(waypoints)
+        self.airport_gateways(airport_icao, true)
     }
-    
-    /// 快速查找机场的STAR入口航点（在航路网络中的航点）
+
     pub fn find_star_entry_waypoints(&self, airport_icao: &str) -> Result<Vec<Waypoint>> {
-        let conn = self.get_connection()?;
-        
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT s.waypoint_identifier, s.waypoint_latitude, s.waypoint_longitude
-             FROM tbl_stars s
-             WHERE s.airport_identifier = ?1 
-               AND s.waypoint_identifier IS NOT NULL
-               AND s.waypoint_identifier IN (
-                 SELECT DISTINCT waypoint_identifier FROM tbl_enroute_airways
-               )
-             LIMIT 20"
-        )?;
-        
-        let waypoints = stmt
-            .query_map(params![airport_icao], |row| {
-                let lat: f64 = row.get(1)?;
-                let lon: f64 = row.get(2)?;
-                
-                Ok(Waypoint {
-                    identifier: row.get::<_, String>(0)?,
-                    icao_code: String::new(),
-                    name: None,
-                    coordinate: Coordinate::new(lat, lon)
-                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-                    waypoint_type: WaypointType::Enroute,
-                    usage: None,
-                    id: None,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        
-        Ok(waypoints)
+        self.airport_gateways(airport_icao, false)
     }
 
-    /// 批量加载整个航路网络的边（用于Dijkstra算法图构建）
-    /// 返回: Vec<(航路名, 起点标识符, 起点坐标, 终点标识符, 终点坐标)>
-    pub fn load_all_airway_edges(&self) -> Result<Vec<(String, String, Coordinate, String, Coordinate)>> {
-        let conn = self.get_connection()?;
-        
-        // 加载所有航路航点，按航路和seqno排序
-        let mut stmt = conn.prepare(
-            "SELECT route_identifier, waypoint_identifier, waypoint_latitude, waypoint_longitude, seqno
-             FROM tbl_enroute_airways
-             ORDER BY route_identifier, seqno"
-        )?;
-        
-        // 收集所有航点
-        let waypoints: Vec<(String, String, f64, f64, i32)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, i32>(4)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        
-        // 在Rust中构建边（相同航路的连续航点形成边）
-        let mut edges = Vec::new();
-        let mut prev: Option<(String, String, f64, f64)> = None;
-        
-        for (route_id, wp_id, lat, lon, _seqno) in waypoints {
-            if let Some((prev_route, prev_wp, prev_lat, prev_lon)) = &prev {
-                if prev_route == &route_id {
-                    // 相同航路，形成边
-                    let coord1 = Coordinate::new(*prev_lat, *prev_lon)?;
-                    let coord2 = Coordinate::new(lat, lon)?;
-                    edges.push((route_id.clone(), prev_wp.clone(), coord1, wp_id.clone(), coord2));
-                }
-            }
-            prev = Some((route_id, wp_id, lat, lon));
-        }
-        
-        Ok(edges)
+    #[allow(clippy::type_complexity)] // Preserve the existing public signature.
+    pub fn load_all_airway_edges(
+        &self,
+    ) -> Result<Vec<(String, String, Coordinate, String, Coordinate)>> {
+        let graph = self.network()?;
+        Ok(graph
+            .edges
+            .iter()
+            .map(|e| {
+                let a = &graph.nodes[e.from];
+                let b = &graph.nodes[e.to];
+                (
+                    graph.airways[graph.records[e.record].airway].clone(),
+                    a.identifier.clone(),
+                    a.coordinate,
+                    b.identifier.clone(),
+                    b.coordinate,
+                )
+            })
+            .collect())
     }
 
-    /// 加载所有航路航点（仅标识符和坐标，用于快速图构建）
     pub fn load_all_airway_waypoints(&self) -> Result<Vec<(String, Coordinate)>> {
-        let conn = self.get_connection()?;
-        
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT waypoint_identifier, waypoint_latitude, waypoint_longitude
-             FROM tbl_enroute_airways"
-        )?;
-        
-        let waypoints = stmt
-            .query_map([], |row| {
-                let lat: f64 = row.get(1)?;
-                let lon: f64 = row.get(2)?;
-                
-                let coord = Coordinate::new(lat, lon)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                
-                Ok((row.get::<_, String>(0)?, coord))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        
-        Ok(waypoints)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_database_pool_creation() {
-        if std::path::Path::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db").exists() {
-            let pool = DatabasePool::new("/app/raw_data/sqlite/e_dfd_PMDG.s3db", 5);
-            assert!(pool.is_ok());
-        }
+        Ok(self
+            .network()?
+            .nodes
+            .iter()
+            .map(|p| (p.identifier.clone(), p.coordinate))
+            .collect())
     }
 }

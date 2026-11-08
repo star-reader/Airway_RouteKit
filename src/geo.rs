@@ -24,8 +24,9 @@ pub fn haversine_distance_nm(coord1: &Coordinate, coord2: &Coordinate) -> f64 {
     let delta_lat = deg_to_rad(coord2.latitude - coord1.latitude);
     let delta_lon = deg_to_rad(coord2.longitude - coord1.longitude);
 
-    let a = (delta_lat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+    let a =
+        (delta_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+    let a = a.clamp(0.0, 1.0);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
     EARTH_RADIUS_NM * c
@@ -38,8 +39,9 @@ pub fn haversine_distance_km(coord1: &Coordinate, coord2: &Coordinate) -> f64 {
     let delta_lat = deg_to_rad(coord2.latitude - coord1.latitude);
     let delta_lon = deg_to_rad(coord2.longitude - coord1.longitude);
 
-    let a = (delta_lat / 2.0).sin().powi(2)
-        + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+    let a =
+        (delta_lat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (delta_lon / 2.0).sin().powi(2);
+    let a = a.clamp(0.0, 1.0);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
     EARTH_RADIUS_KM * c
@@ -47,7 +49,7 @@ pub fn haversine_distance_km(coord1: &Coordinate, coord2: &Coordinate) -> f64 {
 
 /// 计算两个航向之间的转弯角度（度，0-180）
 pub fn bearing_turn_angle(bearing1: f64, bearing2: f64) -> f64 {
-    let diff = (bearing2 - bearing1).abs();
+    let diff = (bearing2 - bearing1).rem_euclid(360.0);
     if diff > 180.0 {
         360.0 - diff
     } else {
@@ -71,8 +73,45 @@ pub fn calculate_bearing(coord1: &Coordinate, coord2: &Coordinate) -> f64 {
     (bearing + 360.0) % 360.0
 }
 
+/// Positive variation of distance to a target along a minor great-circle arc.
+/// Splitting the same arc does not change this quantity. Interior stationary
+/// points are evaluated analytically, rather than sampled at reporting points.
+pub fn distance_regression_nm(a: &Coordinate, b: &Coordinate, target: &Coordinate) -> f64 {
+    distance_regression_from_ranges(
+        haversine_distance_nm(a, target),
+        haversine_distance_nm(b, target),
+        haversine_distance_nm(a, b),
+    )
+}
+
+pub(crate) fn distance_regression_from_ranges(start: f64, end: f64, length: f64) -> f64 {
+    let angle = length / EARTH_RADIUS_NM;
+    if angle < 1e-10 || angle.sin().abs() < 1e-12 {
+        return (end - start).max(0.0);
+    }
+    let a = (start / EARTH_RADIUS_NM).cos();
+    let b = ((end / EARTH_RADIUS_NM).cos() - a * angle.cos()) / angle.sin();
+    let stationary = b.atan2(a);
+    let mut at = start;
+    let mut positive = 0.0;
+    // Consecutive stationary points are pi apart; at most one lies on a minor arc.
+    for k in -1..=2 {
+        let x = stationary + k as f64 * std::f64::consts::PI;
+        if x > 1e-10 && x < angle - 1e-10 {
+            let z = (a * x.cos() + b * x.sin()).clamp(-1.0, 1.0);
+            let value = EARTH_RADIUS_NM * (1.0 - z * z).max(0.0).sqrt().atan2(z);
+            positive += (value - at).max(0.0);
+            at = value;
+        }
+    }
+    positive + (end - at).max(0.0)
+}
+
 /// 计算中点坐标
-pub fn calculate_midpoint(coord1: &Coordinate, coord2: &Coordinate) -> crate::error::Result<Coordinate> {
+pub fn calculate_midpoint(
+    coord1: &Coordinate,
+    coord2: &Coordinate,
+) -> crate::error::Result<Coordinate> {
     let lat1 = deg_to_rad(coord1.latitude);
     let lat2 = deg_to_rad(coord2.latitude);
     let lon1 = deg_to_rad(coord1.longitude);
@@ -81,12 +120,13 @@ pub fn calculate_midpoint(coord1: &Coordinate, coord2: &Coordinate) -> crate::er
     let bx = lat2.cos() * delta_lon.cos();
     let by = lat2.cos() * delta_lon.sin();
 
-    let lat3 = (lat1.sin() + lat2.sin()).atan2(
-        ((lat1.cos() + bx).powi(2) + by.powi(2)).sqrt()
-    );
+    let lat3 = (lat1.sin() + lat2.sin()).atan2(((lat1.cos() + bx).powi(2) + by.powi(2)).sqrt());
     let lon3 = lon1 + by.atan2(lat1.cos() + bx);
 
-    Coordinate::new(rad_to_deg(lat3), rad_to_deg(lon3))
+    Coordinate::new(
+        rad_to_deg(lat3),
+        (rad_to_deg(lon3) + 180.0).rem_euclid(360.0) - 180.0,
+    )
 }
 
 /// 根据起点、距离和航向计算目标点
@@ -110,7 +150,10 @@ pub fn calculate_destination(
         + (brng.sin() * angular_distance.sin() * lat1.cos())
             .atan2(angular_distance.cos() - lat1.sin() * lat2.sin());
 
-    Coordinate::new(rad_to_deg(lat2), rad_to_deg(lon2))
+    Coordinate::new(
+        rad_to_deg(lat2),
+        (rad_to_deg(lon2) + 180.0).rem_euclid(360.0) - 180.0,
+    )
 }
 
 /// 检查点是否在边界框内
@@ -123,8 +166,11 @@ pub fn is_in_bounding_box(
 ) -> bool {
     point.latitude >= min_lat
         && point.latitude <= max_lat
-        && point.longitude >= min_lon
-        && point.longitude <= max_lon
+        && if min_lon <= max_lon {
+            point.longitude >= min_lon && point.longitude <= max_lon
+        } else {
+            point.longitude >= min_lon || point.longitude <= max_lon
+        }
 }
 
 /// 计算边界框
@@ -138,22 +184,44 @@ pub struct BoundingBox {
 impl BoundingBox {
     /// 根据中心点和半径创建边界框
     pub fn from_center_radius(center: &Coordinate, radius_nm: f64) -> Self {
-        let delta_lat = rad_to_deg(radius_nm / EARTH_RADIUS_NM);
-        let delta_lon = rad_to_deg(
-            radius_nm / (EARTH_RADIUS_NM * deg_to_rad(center.latitude).cos())
-        );
+        let angular = (radius_nm.max(0.0) / EARTH_RADIUS_NM).min(std::f64::consts::PI);
+        let delta_lat = rad_to_deg(angular);
+        let all_longitudes = center.latitude.abs() + delta_lat >= 90.0;
+        let delta_lon = if all_longitudes {
+            180.0
+        } else {
+            rad_to_deg(
+                (angular.sin() / deg_to_rad(center.latitude).cos())
+                    .clamp(-1.0, 1.0)
+                    .asin(),
+            )
+        };
 
         Self {
             min_lat: (center.latitude - delta_lat).max(-90.0),
             max_lat: (center.latitude + delta_lat).min(90.0),
-            min_lon: (center.longitude - delta_lon).max(-180.0),
-            max_lon: (center.longitude + delta_lon).min(180.0),
+            min_lon: if all_longitudes {
+                -180.0
+            } else {
+                (center.longitude - delta_lon + 180.0).rem_euclid(360.0) - 180.0
+            },
+            max_lon: if all_longitudes {
+                180.0
+            } else {
+                (center.longitude + delta_lon + 180.0).rem_euclid(360.0) - 180.0
+            },
         }
     }
 
     /// 检查点是否在边界框内
     pub fn contains(&self, point: &Coordinate) -> bool {
-        is_in_bounding_box(point, self.min_lat, self.max_lat, self.min_lon, self.max_lon)
+        is_in_bounding_box(
+            point,
+            self.min_lat,
+            self.max_lat,
+            self.min_lon,
+            self.max_lon,
+        )
     }
 }
 
@@ -166,19 +234,19 @@ mod tests {
         // 北京首都国际机场 (ZBAA) 到 上海浦东国际机场 (ZSPD)
         let zbaa = Coordinate::new(40.0801, 116.5846).unwrap();
         let zspd = Coordinate::new(31.1434, 121.8052).unwrap();
-        
+
         let distance = haversine_distance_nm(&zbaa, &zspd);
-        // 实际距离约为 534 海里
-        assert!((distance - 534.0).abs() < 10.0);
+        // The previous 534 NM fixture was incorrect for these airport coordinates.
+        assert!((distance - 593.0).abs() < 5.0);
     }
 
     #[test]
     fn test_bearing() {
         let coord1 = Coordinate::new(40.0, 116.0).unwrap();
         let coord2 = Coordinate::new(31.0, 121.0).unwrap();
-        
+
         let bearing = calculate_bearing(&coord1, &coord2);
-        assert!(bearing >= 0.0 && bearing < 360.0);
+        assert!((0.0..360.0).contains(&bearing));
     }
 
     #[test]
@@ -192,7 +260,7 @@ mod tests {
     fn test_midpoint() {
         let coord1 = Coordinate::new(40.0, 116.0).unwrap();
         let coord2 = Coordinate::new(30.0, 120.0).unwrap();
-        
+
         let midpoint = calculate_midpoint(&coord1, &coord2).unwrap();
         assert!((midpoint.latitude - 35.0).abs() < 1.0);
         assert!((midpoint.longitude - 118.0).abs() < 1.0);
@@ -202,9 +270,9 @@ mod tests {
     fn test_bounding_box() {
         let center = Coordinate::new(40.0, 116.0).unwrap();
         let bbox = BoundingBox::from_center_radius(&center, 100.0);
-        
+
         assert!(bbox.contains(&center));
-        
+
         let far_point = Coordinate::new(50.0, 130.0).unwrap();
         assert!(!bbox.contains(&far_point));
     }

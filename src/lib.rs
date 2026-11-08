@@ -1,13 +1,13 @@
 //! # RouteKit
 //!
-//! 2025-01-29 @ Jerry Jin
+//! 2026-11-07 @ Jerry Jin
 //!
 //!
 //! ```no_run
 //! use routekit::{RouteKit, RouteRequest, FlightLevel, RoutePreference};
 //!
 //! // 创建RouteKit实例
-//! let kit = RouteKit::new("path/to/database.s3db").unwrap();
+//! let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
 //!
 //! // 查询航路
 //! let request = RouteRequest {
@@ -30,9 +30,15 @@ pub mod config;
 pub mod database;
 pub mod error;
 pub mod ffi;
+mod gateways;
 pub mod geo;
+pub mod geojson;
 pub mod models;
+mod network;
+pub mod oceanic;
 pub mod parser;
+pub mod planning;
+pub mod regions;
 pub mod route;
 pub mod spatial;
 pub mod utils;
@@ -40,11 +46,15 @@ pub mod utils;
 pub use config::Config;
 pub use error::{Result, RouteKitError};
 pub use models::*;
+pub use oceanic::{
+    DetourBudget, OceanicPath, OceanicSource, PathRole, RouteSearchResult, SearchOptions,
+};
+pub use planning::{PlanningContext, PlanningResult, RoutingPolicy};
 pub use route::RouteSearcher;
 
 use database::DatabasePool;
-use parser::RouteParser;
 use parking_lot::RwLock;
+use parser::RouteParser;
 use spatial::SpatialIndex;
 use std::path::Path;
 use std::sync::Arc;
@@ -69,7 +79,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::RouteKit;
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// ```
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let config = Config::default();
@@ -94,7 +104,7 @@ impl RouteKit {
     ///     .build()
     ///     .unwrap();
     ///
-    /// let kit = RouteKit::with_config("raw_data/e_dfd_PMDG.s3db", config).unwrap();
+    /// let kit = RouteKit::with_config("raw_data/e_navdata.s3db", config).unwrap();
     /// ```
     pub fn with_config<P: AsRef<Path>>(db_path: P, config: Config) -> Result<Self> {
         config.validate()?;
@@ -129,15 +139,15 @@ impl RouteKit {
     /// 初始化空间索引（加载所有航点）
     fn initialize_spatial_index(&self) -> Result<()> {
         log::info!("开始初始化空间索引...");
-        
+
         let waypoints = self.db_pool.load_all_waypoints()?;
         let waypoint_count = waypoints.len();
-        
+
         let mut index = self.spatial_index.write();
         index.bulk_insert(waypoints);
-        
+
         log::info!("空间索引初始化完成，共加载 {} 个航点", waypoint_count);
-        
+
         Ok(())
     }
 
@@ -156,7 +166,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::{RouteKit, RouteRequest, FlightLevel, RoutePreference};
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// let request = RouteRequest {
     ///     departure_icao: "ZBAA".to_string(),
     ///     destination_icao: "ZSPD".to_string(),
@@ -184,26 +194,47 @@ impl RouteKit {
         Ok(routes)
     }
 
+    pub fn find_routes_with_options(
+        &self,
+        request: &RouteRequest,
+        options: &SearchOptions,
+    ) -> Result<RouteSearchResult> {
+        self.route_searcher
+            .search_routes_with_options(request, options)
+    }
+
+    pub fn find_routes_with_context(
+        &self,
+        request: &RouteRequest,
+        context: &PlanningContext,
+    ) -> Result<PlanningResult> {
+        self.route_searcher
+            .search_routes_with_context(request, context)
+    }
+
     /// 查询航路（简化版本，仅返回route_string和total_distance_nm）
-    /// 
+    ///
     /// # 示例
-    /// 
+    ///
     /// ```no_run
     /// use routekit::{RouteKit, RouteRequest};
-    /// 
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    ///
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// let request = RouteRequest {
     ///     departure_icao: "ZBAA".to_string(),
     ///     destination_icao: "ZSPD".to_string(),
     ///     ..Default::default()
     /// };
-    /// 
+    ///
     /// let results = kit.find_routes_simple(&request).unwrap();
     /// for result in results {
     ///     println!("{} ({:.1}nm)", result.route_string, result.total_distance_nm);
     /// }
     /// ```
-    pub fn find_routes_simple(&self, request: &RouteRequest) -> Result<Vec<crate::models::RouteResult>> {
+    pub fn find_routes_simple(
+        &self,
+        request: &RouteRequest,
+    ) -> Result<Vec<crate::models::RouteResult>> {
         log::debug!(
             "开始查询航路(简化): {} -> {}",
             request.departure_icao,
@@ -233,7 +264,7 @@ impl RouteKit {
     /// ```no_run
     /// use routekit::RouteKit;
     ///
-    /// let kit = RouteKit::new("raw_data/e_dfd_PMDG.s3db").unwrap();
+    /// let kit = RouteKit::new("raw_data/e_navdata.s3db").unwrap();
     /// let parsed = kit.parse_route("ZBAA SID TEPID G212 VYK STAR ZSPD").unwrap();
     ///
     /// if parsed.is_valid {
@@ -327,6 +358,8 @@ impl RouteKit {
     }
 
     pub fn reload_spatial_index(&self) -> Result<()> {
+        self.db_pool.invalidate();
+        self.route_searcher.clear_cache();
         self.initialize_spatial_index()
     }
 }
@@ -334,10 +367,6 @@ impl RouteKit {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_routekit_creation() {
-    }
 
     #[test]
     fn test_coordinate_creation() {
